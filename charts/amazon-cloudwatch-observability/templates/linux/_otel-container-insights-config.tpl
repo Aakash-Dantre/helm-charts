@@ -121,9 +121,9 @@ receivers:
               action: keep
 
   {{- if and .Values.otelContainerInsights.solutions.enabled .Values.otelContainerInsights.solutions.vllm.enabled }}
-  # vLLM model-server metrics (vllm:* Prometheus series). Pod-discovery scrape
-  # on the local node, keyed on the KServe InferenceService label + container
-  # port 8080. Mirrors the ebs-csi-node pattern.
+  # vLLM model-server metrics (vllm:* Prometheus series). Pod-discovery scrape on
+  # the local node, keyed on the KServe InferenceService label + the model
+  # container's name. Mirrors the ebs-csi-node pattern.
   prometheus/cw_k8s_ci_v0_vllm:
     config:
       scrape_configs:
@@ -144,9 +144,15 @@ receivers:
             - source_labels: [__meta_kubernetes_pod_label_serving_kserve_io_inferenceservice]
               regex: .+
               action: keep
-            # scrape the vLLM container's metrics port (8080, named "user-port")
-            - source_labels: [__meta_kubernetes_pod_container_port_name]
-              regex: user-port
+            # Keep the model container only, so we scrape its port and not the
+            # sidecars'. Key on the container NAME, which KServe sets to
+            # "kserve-container" in both Serverless and RawDeployment mode --
+            # unlike the port name, which is unset in the ServingRuntime and only
+            # becomes "user-port" because Knative renames it when injecting the
+            # queue-proxy. Keying on the port name would find no targets at all in
+            # RawDeployment mode.
+            - source_labels: [__meta_kubernetes_pod_container_name]
+              regex: kserve-container
               action: keep
             # expose the InferenceService name as a label for CloudWatch dimensioning
             - source_labels: [__meta_kubernetes_pod_label_serving_kserve_io_inferenceservice]
