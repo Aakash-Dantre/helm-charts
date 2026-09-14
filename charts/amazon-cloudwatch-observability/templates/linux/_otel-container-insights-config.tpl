@@ -158,6 +158,36 @@ receivers:
             - source_labels: [__meta_kubernetes_pod_label_serving_kserve_io_inferenceservice]
               target_label: inferenceservice
               action: replace
+            # Identify the engine build, so metrics can be compared across a vLLM
+            # upgrade. vLLM does not publish its version on /metrics -- its only
+            # info-type series are python_info and vllm:cache_config_info, and
+            # neither carries it; the version is served from GET /version, which a
+            # prometheus receiver cannot read. The model container's image
+            # reference is therefore the closest available identifier.
+            #
+            # Two rules, matching mutually exclusive image forms, both writing to
+            # the same label (a replace whose regex does not match is a no-op):
+            #   - a digest, which is what KServe Serverless mode yields, because
+            #     Knative resolves the image tag to a digest when it creates the
+            #     Revision. Shortened to 12 hex chars, as is conventional.
+            #   - a tag, which survives in RawDeployment mode, where KServe builds
+            #     the Deployment from the ServingRuntime directly.
+            # An image pinned by neither leaves the label unset.
+            #
+            # $$$1 is Helm escaping: $$$ → $$ (Helm) → $ (OTel env resolver) →
+            # literal $1 backreference. Writing $$1 here renders $1 into the CR,
+            # which the resolver reads as an env var named "1" and the collector
+            # refuses to start.
+            - source_labels: [__meta_kubernetes_pod_container_image]
+              regex: '.*@sha256:([0-9a-f]{12})[0-9a-f]*'
+              target_label: vllm_engine_version
+              replacement: 'sha256:$$$1'
+              action: replace
+            - source_labels: [__meta_kubernetes_pod_container_image]
+              regex: '[^@]*:([^:@]+)'
+              target_label: vllm_engine_version
+              replacement: '$$$1'
+              action: replace
   {{- end }}
 
   {{- if and .Values.otelContainerInsights.solutions.enabled .Values.otelContainerInsights.solutions.knative.dataPlane.enabled }}
