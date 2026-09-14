@@ -425,6 +425,28 @@ processors:
           - set(attributes["cloudwatch.source"], "cloudwatch-agent")
           - set(attributes["cloudwatch.solution"], "k8s-otel-container-insights")
           - set(attributes["cloudwatch.pipeline"], "vllm")
+
+  # The vLLM /metrics endpoint exposes more than the engine's own series: the
+  # default Python client registry adds python_* and process_* families, and the
+  # FastAPI instrumentator adds http_*. Keep vllm:* (the engine) and http_*
+  # (per-endpoint request counts and latencies -- the only HTTP-status telemetry
+  # vLLM emits, and the stand-in for revision_* when KServe runs in
+  # RawDeployment mode without a queue-proxy). Drop the rest:
+  #   python_*   -- interpreter GC counters and a constant-1 python_info gauge.
+  #   process_*  -- API-server process CPU/memory/fds, already covered at the
+  #                 container level by Container Insights core, and colliding by
+  #                 name with the kube-apiserver's own process_* series.
+  #   *_created  -- client_python's per-metric creation timestamp: a constant
+  #                 value repeated on every scrape. Counter-reset detection is
+  #                 handled by metricstarttime/cw_k8s_ci_v0 instead. Safe to drop
+  #                 here because the prometheus receiver has already consumed
+  #                 these to set start timestamps before processors run.
+  filter/cw_k8s_ci_v0_vllm_keep:
+    error_mode: ignore
+    metrics:
+      metric:
+        - 'not IsMatch(name, "^(vllm:|http_).*")'
+        - 'IsMatch(name, ".*_created$")'
   {{- end }}
 
   {{- if and .Values.otelContainerInsights.solutions.enabled .Values.otelContainerInsights.solutions.knative.dataPlane.enabled }}
@@ -1081,6 +1103,7 @@ service:
       receivers: [prometheus/cw_k8s_ci_v0_vllm]
       processors:
         - filter/cw_k8s_ci_v0_scrape_metadata
+        - filter/cw_k8s_ci_v0_vllm_keep
         - transform/cw_k8s_ci_v0_set_unit
         - metricstarttime/cw_k8s_ci_v0
         - transform/cw_k8s_ci_v0_set_cluster_name
