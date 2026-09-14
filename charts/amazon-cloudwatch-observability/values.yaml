@@ -1195,10 +1195,77 @@ otelContainerInsights:
       enabled: true
       ## Namespace where KEDA is deployed.
       namespace: "keda"
-  ## Optional Prometheus scraping of vLLM model-server metrics (vllm:* series)
-  ## from KServe InferenceService pods, published through the OTEL CI pipeline.
-  ## Only takes effect when otelContainerInsights.enabled is true.
-  vllm:
-    enabled: false
-    ## Namespace where the vLLM/KServe InferenceService pods run. Empty = all namespaces.
-    namespace: ""
+    ## ── Model serving ────────────────────────────────────────────────────
+    ## A KServe deployment emits telemetry from three independent components,
+    ## each with its own toggle below. Which of them exist depends on the
+    ## KServe deployment mode:
+    ##
+    ##   Serverless (KServe's default) — KServe reconciles an InferenceService
+    ##     into a Knative Service, so all three sources are present.
+    ##   RawDeployment — KServe reconciles into a plain Deployment + HPA and
+    ##     Knative is not involved at all, so only vllm and kserve.controlPlane
+    ##     exist. The knative.* scrapes will find no targets. Use the HPA
+    ##     metrics from kube-state-metrics for the autoscaling view instead.
+    ##
+    ## Note that the request-level telemetry (revision_*) is emitted by the
+    ## Knative queue-proxy, not by KServe — KServe is a control plane only and
+    ## is never in the request path. Hence knative.dataPlane, not kserve.
+    ##
+    ## vLLM model server — the engine's own metrics (vllm:* series), scraped
+    ## from the model container. Covers time-to-first-token, inter-token
+    ## latency, KV cache utilisation and scheduler queue depth.
+    vllm:
+      enabled: false
+      ## Namespace where the vLLM/KServe InferenceService pods run. Empty = all namespaces.
+      namespace: ""
+    ## KServe — the model-serving operator.
+    kserve:
+      ## Scrape of the KServe control-plane health metrics
+      ## (controller_runtime_* / workqueue_* / rest_client_* / leader_election_*)
+      ## from the kserve-controller-manager, exposed via its kube-rbac-proxy on
+      ## :8443 (HTTPS + the agent ServiceAccount bearer token). This runs on the
+      ## cluster-scraper (a singleton), NOT the per-node daemonset, because the
+      ## controller-manager is a single cluster-wide component. Requires the agent
+      ## ServiceAccount to be allowed `get` on the /metrics nonResourceURL (the
+      ## chart's cloudwatch-agent-role already grants this).
+      ##
+      ## These are operator-health metrics: they report whether InferenceService
+      ## reconciliation is succeeding, not how the models themselves are serving.
+      controlPlane:
+        enabled: false
+        ## Namespace where the kserve-controller-manager runs.
+        namespace: kserve
+    ## Knative Serving — the runtime substrate KServe delegates to in
+    ## Serverless mode. Absent entirely in RawDeployment mode.
+    knative:
+      ## Request metrics (revision_* series) from the queue-proxy sidecar
+      ## (port 9091) that Knative injects beside the model container. This is
+      ## the HTTP view of inference traffic: request rate, end-to-end latency
+      ## and response_code breakdown, measured at the proxy and so including
+      ## time a request spent queued before the engine received it. Only the
+      ## request telemetry (revision_app_request_* / revision_request_*) is
+      ## kept; revision_go_* runtime metrics are dropped.
+      ##
+      ## Scraped by the per-node daemonset, since the queue-proxy is a sidecar
+      ## on every predictor pod. Discovery keys on the Knative revision label,
+      ## so this also covers plain Knative Services with no KServe involved.
+      dataPlane:
+        enabled: false
+        ## Namespace where the Knative revision (KServe predictor) pods run.
+        ## Empty = all namespaces.
+        namespace: ""
+      ## Scrape of the Knative Serving control-plane metrics — the autoscaling
+      ## story (autoscaler_desired_pods / autoscaler_actual_pods /
+      ## autoscaler_requested_pods / autoscaler_stable_request_concurrency /
+      ## autoscaler_panic_request_concurrency / autoscaler_panic_mode /
+      ## autoscaler_excess_burst_capacity, plus scale-to-zero via
+      ## autoscaler_*_pods dropping to 0) together with the activator,
+      ## controller and webhook reconcile/workqueue metrics. These components
+      ## expose plain HTTP (no auth) on the container port named "metrics"
+      ## (:9090) in the knative-serving namespace. Scraped by the
+      ## cluster-scraper (singleton), via pod-role discovery; the net-istio-*
+      ## networking pods are excluded. Go/process runtime metrics are dropped.
+      controlPlane:
+        enabled: false
+        ## Namespace where the Knative Serving components run.
+        namespace: knative-serving

@@ -120,7 +120,7 @@ receivers:
               regex: metrics
               action: keep
 
-  {{- if .Values.otelContainerInsights.vllm.enabled }}
+  {{- if and .Values.otelContainerInsights.solutions.enabled .Values.otelContainerInsights.solutions.vllm.enabled }}
   # vLLM model-server metrics (vllm:* Prometheus series). Pod-discovery scrape
   # on the local node, keyed on the KServe InferenceService label + container
   # port 8080. Mirrors the ebs-csi-node pattern.
@@ -133,10 +133,10 @@ receivers:
           metrics_path: /metrics
           kubernetes_sd_configs:
             - role: pod
-              {{- if .Values.otelContainerInsights.vllm.namespace }}
+              {{- if .Values.otelContainerInsights.solutions.vllm.namespace }}
               namespaces:
                 names:
-                  - {{ .Values.otelContainerInsights.vllm.namespace }}
+                  - {{ .Values.otelContainerInsights.solutions.vllm.namespace }}
               {{- end }}
           relabel_configs:
             # keep only KServe InferenceService pods (match the label VALUE, like
@@ -147,6 +147,41 @@ receivers:
             # scrape the vLLM container's metrics port (8080, named "user-port")
             - source_labels: [__meta_kubernetes_pod_container_port_name]
               regex: user-port
+              action: keep
+            # expose the InferenceService name as a label for CloudWatch dimensioning
+            - source_labels: [__meta_kubernetes_pod_label_serving_kserve_io_inferenceservice]
+              target_label: inferenceservice
+              action: replace
+  {{- end }}
+
+  {{- if and .Values.otelContainerInsights.solutions.enabled .Values.otelContainerInsights.solutions.knative.dataPlane.enabled }}
+  # Knative data-plane request metrics (revision_* series) from the queue-proxy
+  # sidecar's user-metric port (9091, named "http-usermetric"). Same pod-discovery
+  # pattern as the vLLM job, but keyed on the Knative revision label -- so this
+  # covers plain Knative Services too, not just KServe predictors. The
+  # revision_go_* runtime series are dropped downstream (see the *_keep filter).
+  prometheus/cw_k8s_ci_v0_knative_dataplane:
+    config:
+      scrape_configs:
+        - job_name: knative-dataplane
+          scrape_interval: {{ .Values.otelContainerInsights.metricResolution }}
+          scrape_timeout: {{ include "otel-container-insights.scrapeTimeout" . }}
+          metrics_path: /metrics
+          kubernetes_sd_configs:
+            - role: pod
+              {{- if .Values.otelContainerInsights.solutions.knative.dataPlane.namespace }}
+              namespaces:
+                names:
+                  - {{ .Values.otelContainerInsights.solutions.knative.dataPlane.namespace }}
+              {{- end }}
+          relabel_configs:
+            # keep only Knative revision (KServe predictor) pods
+            - source_labels: [__meta_kubernetes_pod_label_serving_knative_dev_revision]
+              regex: .+
+              action: keep
+            # scrape the queue-proxy user-metric port (9091, named "http-usermetric")
+            - source_labels: [__meta_kubernetes_pod_container_port_name]
+              regex: http-usermetric
               action: keep
             # expose the InferenceService name as a label for CloudWatch dimensioning
             - source_labels: [__meta_kubernetes_pod_label_serving_kserve_io_inferenceservice]
@@ -373,15 +408,39 @@ processors:
           - set(attributes["cloudwatch.solution"], "k8s-otel-container-insights")
           - set(attributes["cloudwatch.pipeline"], "ebs-csi")
 
+  {{- if and .Values.otelContainerInsights.solutions.enabled .Values.otelContainerInsights.solutions.vllm.enabled }}
   transform/cw_k8s_ci_v0_set_scope_vllm:
     error_mode: ignore
     metric_statements:
       - context: scope
         statements:
+          - set(scope.name, "github.com/vllm-project/vllm")
           - set(scope.schema_url, "")
           - set(attributes["cloudwatch.source"], "cloudwatch-agent")
           - set(attributes["cloudwatch.solution"], "k8s-otel-container-insights")
           - set(attributes["cloudwatch.pipeline"], "vllm")
+  {{- end }}
+
+  {{- if and .Values.otelContainerInsights.solutions.enabled .Values.otelContainerInsights.solutions.knative.dataPlane.enabled }}
+  transform/cw_k8s_ci_v0_set_scope_knative_dataplane:
+    error_mode: ignore
+    metric_statements:
+      - context: scope
+        statements:
+          - set(scope.name, "knative.dev/serving")
+          - set(scope.schema_url, "")
+          - set(attributes["cloudwatch.source"], "cloudwatch-agent")
+          - set(attributes["cloudwatch.solution"], "k8s-otel-container-insights")
+          - set(attributes["cloudwatch.pipeline"], "knative-dataplane")
+
+  # Keep only the Knative request telemetry (revision_app_request_* and
+  # revision_request_*); drop the queue-proxy's revision_go_* runtime noise.
+  filter/cw_k8s_ci_v0_knative_dataplane_keep:
+    error_mode: ignore
+    metrics:
+      metric:
+        - 'not IsMatch(name, "^revision_.*request.*")'
+  {{- end }}
 
   transform/cw_k8s_ci_v0_set_scope_lis_csi:
     error_mode: ignore
@@ -1011,7 +1070,7 @@ service:
       exporters:
         - otlphttp/cw_k8s_ci_v0_metrics_dest
 
-{{- if .Values.otelContainerInsights.vllm.enabled }}
+{{- if and .Values.otelContainerInsights.solutions.enabled .Values.otelContainerInsights.solutions.vllm.enabled }}
     metrics/cw_k8s_ci_v0_vllm:
       receivers: [prometheus/cw_k8s_ci_v0_vllm]
       processors:
@@ -1025,6 +1084,29 @@ service:
         - transform/cw_k8s_ci_v0_set_cloud_resource_id
         - k8sattributes/cw_k8s_ci_v0_node
         - transform/cw_k8s_ci_v0_set_scope_vllm
+        - transform/cw_k8s_ci_v0_clear_schema_url
+        - transform/cw_k8s_ci_v0_set_workload
+        - awsattributelimit/cw_k8s_ci_v0
+        - batch/cw_k8s_ci_v0_metrics_dest
+      exporters:
+        - otlphttp/cw_k8s_ci_v0_metrics_dest
+{{- end }}
+
+{{- if and .Values.otelContainerInsights.solutions.enabled .Values.otelContainerInsights.solutions.knative.dataPlane.enabled }}
+    metrics/cw_k8s_ci_v0_knative_dataplane:
+      receivers: [prometheus/cw_k8s_ci_v0_knative_dataplane]
+      processors:
+        - filter/cw_k8s_ci_v0_scrape_metadata
+        - filter/cw_k8s_ci_v0_knative_dataplane_keep
+        - transform/cw_k8s_ci_v0_set_unit
+        - metricstarttime/cw_k8s_ci_v0
+        - transform/cw_k8s_ci_v0_set_cluster_name
+        - transform/cw_k8s_ci_v0_set_node_name
+        - transform/cw_k8s_ci_v0_promote_node_name
+        - resourcedetection/cw_k8s_ci_v0
+        - transform/cw_k8s_ci_v0_set_cloud_resource_id
+        - k8sattributes/cw_k8s_ci_v0_node
+        - transform/cw_k8s_ci_v0_set_scope_knative_dataplane
         - transform/cw_k8s_ci_v0_clear_schema_url
         - transform/cw_k8s_ci_v0_set_workload
         - awsattributelimit/cw_k8s_ci_v0
