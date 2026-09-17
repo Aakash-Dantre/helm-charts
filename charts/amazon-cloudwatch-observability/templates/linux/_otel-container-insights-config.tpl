@@ -160,6 +160,22 @@ receivers:
               action: replace
   {{- end }}
 
+  {{- if include "otel-container-insights.vllmTracesEnabled" . }}
+  # vLLM request traces, pushed by the engine's OTLP exporter rather than
+  # scraped. Enabling this only opens the receiving end -- the engine sends
+  # nothing until it is started with --otlp-traces-endpoint.
+  #
+  # The agent runs with hostNetwork: true, so these bind on the node. They avoid
+  # the conventional 4317/4318, which a customer's own collector is likely to
+  # hold; Application Signals uses 4315/4316 for the same reason.
+  otlp/cw_k8s_ci_v0_vllm_traces:
+    protocols:
+      grpc:
+        endpoint: "0.0.0.0:{{ .Values.otelContainerInsights.solutions.vllm.traces.grpcPort }}"
+      http:
+        endpoint: "0.0.0.0:{{ .Values.otelContainerInsights.solutions.vllm.traces.httpPort }}"
+  {{- end }}
+
   {{- if and .Values.otelContainerInsights.solutions.enabled .Values.otelContainerInsights.solutions.knative.dataPlane.enabled }}
   # Knative data-plane request metrics (revision_* series) from the queue-proxy
   # sidecar's user-metric port (9091, named "http-usermetric"). Same pod-discovery
@@ -447,6 +463,57 @@ processors:
       metric:
         - 'not IsMatch(name, "^(vllm:|http_).*")'
         - 'IsMatch(name, ".*_created$")'
+  {{- end }}
+
+  {{- if include "otel-container-insights.vllmTracesEnabled" . }}
+  # Spans arrive with nothing Kubernetes-shaped on them, so give them the same
+  # resource identity the scraped vLLM metrics get. Association is by connection
+  # source IP, because the engine does not know what pod it is; the informer can
+  # stay node-scoped because the agent's Service is internalTrafficPolicy: Local,
+  # so the sender is always a pod on this node.
+  k8sattributes/cw_k8s_ci_v0_vllm_traces:
+    auth_type: serviceAccount
+    passthrough: false
+    filter:
+      node_from_env_var: K8S_NODE_NAME
+    extract:
+      metadata:
+        - k8s.namespace.name
+        - k8s.pod.name
+        - k8s.pod.uid
+        - k8s.node.name
+        - k8s.deployment.name
+        - k8s.statefulset.name
+        - k8s.daemonset.name
+        - k8s.replicaset.name
+        - k8s.job.name
+        - k8s.cronjob.name
+      labels:
+        # Same label the metrics scrape job relabels in, so both join on it.
+        - tag_name: "inferenceservice"
+          key: "serving.kserve.io/inferenceservice"
+          from: pod
+    pod_association:
+      - sources:
+          - from: connection
+
+  transform/cw_k8s_ci_v0_vllm_traces_resource:
+    error_mode: ignore
+    trace_statements:
+      - context: resource
+        statements:
+          - set(resource.attributes["k8s.cluster.name"], "{{ .Values.clusterName }}")
+          # Without OTEL_SERVICE_NAME the engine reports "unknown_service", which
+          # would collapse every vLLM pod onto one X-Ray node. Fall back to the
+          # InferenceService, then the workload, then the pod.
+          - set(resource.attributes["service.name"], resource.attributes["inferenceservice"]) where resource.attributes["inferenceservice"] != nil and (resource.attributes["service.name"] == nil or IsMatch(resource.attributes["service.name"], "^unknown_service"))
+          - set(resource.attributes["service.name"], resource.attributes["k8s.deployment.name"]) where resource.attributes["k8s.deployment.name"] != nil and (resource.attributes["service.name"] == nil or IsMatch(resource.attributes["service.name"], "^unknown_service"))
+          - set(resource.attributes["service.name"], resource.attributes["k8s.pod.name"]) where resource.attributes["k8s.pod.name"] != nil and (resource.attributes["service.name"] == nil or IsMatch(resource.attributes["service.name"], "^unknown_service"))
+
+  batch/cw_k8s_ci_v0_traces_dest:
+    send_batch_size: 50
+    send_batch_max_size: 50
+    timeout: 5s
   {{- end }}
 
   {{- if and .Values.otelContainerInsights.solutions.enabled .Values.otelContainerInsights.solutions.knative.dataPlane.enabled }}
@@ -911,6 +978,46 @@ processors:
 {{- end }}
 
 exporters:
+{{- if include "otel-container-insights.vllmTracesEnabled" . }}
+  # CloudWatchAgentServerPolicy already carries xray:PutTraceSegments, so traces
+  # need no IAM change.
+  #
+  # Only attributes named here become annotations, and only annotations are
+  # searchable with a filter expression; X-Ray allows 50 per segment. Everything
+  # else on the span still arrives, as segment metadata.
+  #
+  # These are vLLM's own attribute names. The exporter matches indexed_attributes
+  # against the unmodified key, then normalises the key it writes: with the
+  # exporter.xray.allowDot feature gate (beta since collector v0.97.0) the dot is
+  # kept, otherwise it becomes an underscore. So search with
+  # `annotation[gen_ai.latency.e2e]` -- the brackets are required for any key
+  # holding a dot -- or with `annotation.gen_ai_latency_e2e` if the gate is off.
+  #
+  # The first 13 are what the V1 engine emits; the other 5 attributes vLLM
+  # defines are dead constants left from the V0 engine. The otel.resource.*
+  # entries are how the exporter names resource attributes, and are what makes a
+  # search scopable to one model, pod or namespace.
+  awsxray/cw_k8s_ci_v0_vllm_traces:
+    region: {{ .Values.region }}
+    index_all_attributes: false
+    indexed_attributes:
+      - gen_ai.latency.e2e
+      - gen_ai.latency.time_to_first_token
+      - gen_ai.latency.time_in_queue
+      - gen_ai.latency.time_in_model_prefill
+      - gen_ai.latency.time_in_model_decode
+      - gen_ai.latency.time_in_model_inference
+      - gen_ai.usage.prompt_tokens
+      - gen_ai.usage.completion_tokens
+      - gen_ai.request.id
+      - gen_ai.request.temperature
+      - gen_ai.request.top_p
+      - gen_ai.request.max_tokens
+      - gen_ai.request.n
+      - otel.resource.inferenceservice
+      - otel.resource.k8s.pod.name
+      - otel.resource.k8s.namespace.name
+{{- end }}
   otlphttp/cw_k8s_ci_v0_metrics_dest:
     endpoint: {{ if .Values.otelContainerInsights.cloudwatchMetricsEndpoint }}{{ .Values.otelContainerInsights.cloudwatchMetricsEndpoint | quote }}{{ else }}"https://monitoring.{{ .Values.region }}.amazonaws.com:443"{{ end }}
     tls:
@@ -1119,6 +1226,20 @@ service:
         - batch/cw_k8s_ci_v0_metrics_dest
       exporters:
         - otlphttp/cw_k8s_ci_v0_metrics_dest
+{{- end }}
+
+{{- if include "otel-container-insights.vllmTracesEnabled" . }}
+    # No filter processor: nothing arrives unless an engine was pointed here.
+    # resourcedetection runs after k8sattributes, as in the metrics pipelines.
+    traces/cw_k8s_ci_v0_vllm:
+      receivers: [otlp/cw_k8s_ci_v0_vllm_traces]
+      processors:
+        - k8sattributes/cw_k8s_ci_v0_vllm_traces
+        - transform/cw_k8s_ci_v0_vllm_traces_resource
+        - resourcedetection/cw_k8s_ci_v0
+        - batch/cw_k8s_ci_v0_traces_dest
+      exporters:
+        - awsxray/cw_k8s_ci_v0_vllm_traces
 {{- end }}
 
 {{- if and .Values.otelContainerInsights.solutions.enabled .Values.otelContainerInsights.solutions.knative.dataPlane.enabled }}

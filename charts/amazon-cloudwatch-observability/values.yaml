@@ -1218,6 +1218,39 @@ otelContainerInsights:
       enabled: false
       ## Namespace where the vLLM/KServe InferenceService pods run. Empty = all namespaces.
       namespace: ""
+      ## vLLM request traces, sent to AWS X-Ray.
+      ##
+      ## The metrics above give you the aggregate -- p99 time-to-first-token
+      ## across the fleet. Traces give you one request: its queue wait, prefill
+      ## and decode time, and token counts. That is what you need when a single
+      ## caller reports a slow response.
+      ##
+      ## This flag is only the receiving half. vLLM's tracing is off by default
+      ## and is enabled with an argument on the model container, which lives on
+      ## your InferenceService and so cannot be set by this chart:
+      ##
+      ##   args:
+      ##     - --otlp-traces-endpoint=grpc://cloudwatch-agent.amazon-cloudwatch:4319
+      ##
+      ## Point it at the gRPC port. The scheme does not select the protocol --
+      ## vLLM's exporter is OTLP/gRPC unless OTEL_EXPORTER_OTLP_TRACES_PROTOCOL
+      ## says otherwise -- it selects TLS, so `grpc://` or `http://` work and
+      ## `https://` fails: the receiver above serves plaintext. On vLLM 0.11 also
+      ## set OTEL_EXPORTER_OTLP_TRACES_INSECURE=true; 0.26 needs nothing.
+      ## `--collect-detailed-traces` is not needed; it does nothing for traces on
+      ## the V1 engine.
+      ##
+      ## X-Ray charges per trace and vLLM emits one span per request with no
+      ## sampling of its own, so on a high-QPS endpoint set OTEL_TRACES_SAMPLER
+      ## on the engine.
+      traces:
+        enabled: false
+        ## Ports the agent listens on for engine-pushed spans. The agent runs
+        ## with hostNetwork: true, so these bind on the node; they avoid the
+        ## standard 4317/4318 so as not to collide with a collector you already
+        ## run. Change them only if something on your nodes holds these.
+        grpcPort: 4319
+        httpPort: 4320
     ## KServe — the model-serving operator.
     kserve:
       ## Scrape of the KServe control-plane health metrics
