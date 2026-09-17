@@ -424,16 +424,24 @@ processors:
 {{- end }}
 
 {{- if and .Values.otelContainerInsights.solutions.enabled .Values.otelContainerInsights.solutions.knative.controlPlane.enabled }}
-  # Drop Go/process runtime noise; keep the Knative Serving control-plane
-  # families — autoscaler_* (desired/actual/requested pods, stable & panic
-  # request concurrency, panic mode, excess burst capacity), activator_*, and
-  # the controller/webhook reconcile + workqueue metrics.
+  # Drop Go/process/scrape-handler runtime noise; keep the Knative Serving
+  # control-plane families -- the scaling decision (desired/actual/requested
+  # pods, stable & panic request concurrency, panic mode, excess burst capacity),
+  # the activator, and the controller/webhook reconcile + workqueue metrics.
+  #
+  # Serving 1.19 moved observability to the OpenTelemetry SDK, which renamed the
+  # component families (autoscaler_desired_pods -> kn_revision_pods_desired, and
+  # so on) and, more importantly here, renamed the runtime ones: <= 1.18 emitted
+  # them per component as autoscaler_go_* / revision_go_*, >= 1.19 emits them
+  # bare as go_*. Both patterns are needed -- ".*_go_.*" does not match "go_*".
   filter/cw_k8s_ci_v0_knative_controlplane_keep:
     error_mode: ignore
     metrics:
       metric:
         - 'IsMatch(name, ".*_go_.*")'
+        - 'IsMatch(name, "^go_.*")'
         - 'IsMatch(name, "^process_.*")'
+        - 'IsMatch(name, "^promhttp_.*")'
 
   transform/cw_k8s_ci_v0_set_scope_knative_controlplane:
     error_mode: ignore

@@ -177,11 +177,16 @@ receivers:
   {{- end }}
 
   {{- if and .Values.otelContainerInsights.solutions.enabled .Values.otelContainerInsights.solutions.knative.dataPlane.enabled }}
-  # Knative data-plane request metrics (revision_* series) from the queue-proxy
-  # sidecar's user-metric port (9091, named "http-usermetric"). Same pod-discovery
-  # pattern as the vLLM job, but keyed on the Knative revision label -- so this
-  # covers plain Knative Services too, not just KServe predictors. The
-  # revision_go_* runtime series are dropped downstream (see the *_keep filter).
+  # Knative data-plane request metrics from the queue-proxy sidecar's user-metric
+  # port (9091, named "http-usermetric"). Same pod-discovery pattern as the vLLM
+  # job, but keyed on the Knative revision label -- so this covers plain Knative
+  # Services too, not just KServe predictors. Runtime series are dropped
+  # downstream (see the *_keep filter).
+  #
+  # The port only serves once Knative is told to export request metrics. On
+  # Serving >= 1.19 that is `request-metrics-protocol: prometheus` in the
+  # config-observability ConfigMap; it defaults to none, and while it is none
+  # the port refuses connections and this scrape finds nothing.
   prometheus/cw_k8s_ci_v0_knative_dataplane:
     config:
       scrape_configs:
@@ -528,13 +533,17 @@ processors:
           - set(attributes["cloudwatch.solution"], "k8s-otel-container-insights")
           - set(attributes["cloudwatch.pipeline"], "knative-dataplane")
 
-  # Keep only the Knative request telemetry (revision_app_request_* and
-  # revision_request_*); drop the queue-proxy's revision_go_* runtime noise.
+  # Keep only the Knative request telemetry; drop the queue-proxy's runtime noise.
+  # Two name sets, because Serving 1.19 moved observability to the OpenTelemetry
+  # SDK and renamed every metric:
+  #   <= 1.18  revision_request_count / _latencies, revision_app_request_*
+  #   >= 1.19  kn_serving_invocation_duration_*, kn_serving_queue_depth
+  #            (from kn.serving.invocation.duration / kn.serving.queue.depth)
   filter/cw_k8s_ci_v0_knative_dataplane_keep:
     error_mode: ignore
     metrics:
       metric:
-        - 'not IsMatch(name, "^revision_.*request.*")'
+        - 'not IsMatch(name, "^(revision_.*request.*|kn_serving_.*)")'
   {{- end }}
 
   transform/cw_k8s_ci_v0_set_scope_lis_csi:
