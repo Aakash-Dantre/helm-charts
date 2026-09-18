@@ -1221,102 +1221,39 @@ otelContainerInsights:
       enabled: false
       ## Namespace where the vLLM/KServe InferenceService pods run. Empty = all namespaces.
       namespace: ""
-      ## vLLM request traces, sent to the CloudWatch OTLP traces endpoint.
+      ## vLLM request traces, exported to the CloudWatch OTLP traces endpoint.
       ##
-      ## The metrics above give you the aggregate -- p99 time-to-first-token
-      ## across the fleet. Traces give you one request: its queue wait, prefill
-      ## and decode time, and token counts. That is what you need when a single
-      ## caller reports a slow response.
-      ##
-      ## This flag is only the receiving half. vLLM's tracing is off by default
-      ## and is enabled with an argument on the model container, which lives on
-      ## your InferenceService and so cannot be set by this chart:
-      ##
-      ##   args:
-      ##     - --otlp-traces-endpoint=grpc://cloudwatch-agent.amazon-cloudwatch:4319
-      ##
-      ## Point it at the gRPC port. The scheme does not select the protocol --
-      ## vLLM's exporter is OTLP/gRPC unless OTEL_EXPORTER_OTLP_TRACES_PROTOCOL
-      ## says otherwise -- it selects TLS, so `grpc://` or `http://` work and
-      ## `https://` fails: the receiver above serves plaintext. On vLLM 0.11 also
-      ## set OTEL_EXPORTER_OTLP_TRACES_INSECURE=true; 0.26 needs nothing.
-      ## `--collect-detailed-traces` is not needed; it does nothing for traces on
-      ## the V1 engine.
-      ##
-      ## Enable Transaction Search on the account before turning this on. The
-      ## agent exports to the CloudWatch OTLP traces endpoint, which stores spans
-      ## in the aws/spans log group; until Transaction Search is enabled that
-      ## endpoint is not usable and spans do not appear.
-      ##
-      ## Spans are billed per trace and vLLM emits one per request with no
-      ## sampling of its own, so on a high-QPS endpoint set OTEL_TRACES_SAMPLER
-      ## on the engine.
+      ## Requires Transaction Search enabled on the account, and the engine
+      ## started with --otlp-traces-endpoint=grpc://cloudwatch-agent.amazon-cloudwatch:4319
+      ## (this chart only opens the receiver). See the chart README.
       traces:
         enabled: false
-        ## Ports the agent listens on for engine-pushed spans. The agent runs
-        ## with hostNetwork: true, so these bind on the node; they avoid the
-        ## standard 4317/4318 so as not to collide with a collector you already
-        ## run. Change them only if something on your nodes holds these.
+        ## Agent listen ports for engine-pushed spans; bound on the node
+        ## (hostNetwork), so they avoid the usual 4317/4318.
         grpcPort: 4319
         httpPort: 4320
-    ## KServe — the model-serving operator.
+    ## KServe operator health (controller_runtime_* / workqueue_* /
+    ## rest_client_* / leader_election_*) from the kserve-controller-manager,
+    ## via its kube-rbac-proxy on :8443. Scraped by the cluster-scraper.
     kserve:
-      ## Scrape of the KServe control-plane health metrics
-      ## (controller_runtime_* / workqueue_* / rest_client_* / leader_election_*)
-      ## from the kserve-controller-manager, exposed via its kube-rbac-proxy on
-      ## :8443 (HTTPS + the agent ServiceAccount bearer token). This runs on the
-      ## cluster-scraper (a singleton), NOT the per-node daemonset, because the
-      ## controller-manager is a single cluster-wide component. Requires the agent
-      ## ServiceAccount to be allowed `get` on the /metrics nonResourceURL (the
-      ## chart's cloudwatch-agent-role already grants this).
-      ##
-      ## These are operator-health metrics: they report whether InferenceService
-      ## reconciliation is succeeding, not how the models themselves are serving.
       controlPlane:
         enabled: false
         ## Namespace where the kserve-controller-manager runs.
         namespace: kserve
-    ## Knative Serving — the runtime substrate KServe delegates to in
-    ## Serverless mode. Absent entirely in RawDeployment mode.
+    ## Knative Serving — the substrate KServe uses in Serverless mode; absent in
+    ## RawDeployment mode. Metric names differ either side of Serving 1.19; both
+    ## sets are handled. See the chart README.
     knative:
-      ## Request metrics from the queue-proxy sidecar (port 9091) that Knative
-      ## injects beside the model container. This is the HTTP view of inference
-      ## traffic: request rate, latency and response-code breakdown, measured at
-      ## the proxy and so including time a request spent queued before the engine
-      ## received it. Metric names depend on the Serving version -- 1.19 moved to
-      ## the OpenTelemetry SDK -- so both sets are kept and the runtime metrics
-      ## are dropped:
-      ##   <= 1.18  revision_request_count / _latencies, revision_app_request_*
-      ##   >= 1.19  kn_serving_invocation_duration_*, kn_serving_queue_depth
-      ##
-      ## Requires Knative to be exporting them. On >= 1.19 set
-      ## `request-metrics-protocol: prometheus` in the config-observability
-      ## ConfigMap; it defaults to none, and until it is set port 9091 refuses
-      ## connections and this scrape yields nothing. Note this is a separate key
-      ## from `metrics-protocol`, which governs the control plane only.
-      ##
-      ## Scraped by the per-node daemonset, since the queue-proxy is a sidecar
-      ## on every predictor pod. Discovery keys on the Knative revision label,
-      ## so this also covers plain Knative Services with no KServe involved.
+      ## Request metrics from the queue-proxy sidecar (:9091), scraped by the
+      ## daemonset. On >= 1.19 also needs `request-metrics-protocol: prometheus`
+      ## in the config-observability ConfigMap, or :9091 serves nothing.
       dataPlane:
         enabled: false
         ## Namespace where the Knative revision (KServe predictor) pods run.
         ## Empty = all namespaces.
         namespace: ""
-      ## Scrape of the Knative Serving control-plane metrics — the autoscaling
-      ## story (desired / actual / requested pods, stable and panic request
-      ## concurrency, panic mode, excess burst capacity, plus scale-to-zero as
-      ## the pod counts drop to 0) together with the activator, controller and
-      ## webhook reconcile/workqueue metrics. Names again depend on the version:
-      ##   <= 1.18  autoscaler_desired_pods, activator_*, webhook_*, controller_*
-      ##   >= 1.19  kn_revision_pods_desired, kn_activator_*, kn_webhook_*,
-      ##            kn_workqueue_*, plus semconv http_server_* / http_client_*
-      ## Requires `metrics-protocol: prometheus` in config-observability on
-      ## >= 1.19. These components
-      ## expose plain HTTP (no auth) on the container port named "metrics"
-      ## (:9090) in the knative-serving namespace. Scraped by the
-      ## cluster-scraper (singleton), via pod-role discovery; the net-istio-*
-      ## networking pods are excluded. Go/process runtime metrics are dropped.
+      ## Autoscaler / activator / controller / webhook metrics from :9090 in the
+      ## knative-serving namespace, scraped by the cluster-scraper.
       controlPlane:
         enabled: false
         ## Namespace where the Knative Serving components run.
