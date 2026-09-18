@@ -1173,6 +1173,9 @@ otelContainerInsights:
   cloudwatchMetricsEndpoint: ""
   # Override the CloudWatch Logs OTLP endpoint. If empty, defaults to logs.<region>.amazonaws.com.
   cloudwatchLogsEndpoint: ""
+  # Override the CloudWatch Traces OTLP endpoint. If empty, defaults to
+  # xray.<region>.amazonaws.com/v1/traces.
+  cloudwatchTracesEndpoint: ""
   ## ── Solutions ──────────────────────────────────────────────────────────
   ## Optional Prometheus metric scraping for well-known cluster components.
   ## Each solution is gated by its own enabled flag so customers only scrape
@@ -1218,7 +1221,7 @@ otelContainerInsights:
       enabled: false
       ## Namespace where the vLLM/KServe InferenceService pods run. Empty = all namespaces.
       namespace: ""
-      ## vLLM request traces, sent to AWS X-Ray.
+      ## vLLM request traces, sent to the CloudWatch OTLP traces endpoint.
       ##
       ## The metrics above give you the aggregate -- p99 time-to-first-token
       ## across the fleet. Traces give you one request: its queue wait, prefill
@@ -1240,7 +1243,12 @@ otelContainerInsights:
       ## `--collect-detailed-traces` is not needed; it does nothing for traces on
       ## the V1 engine.
       ##
-      ## X-Ray charges per trace and vLLM emits one span per request with no
+      ## Enable Transaction Search on the account before turning this on. The
+      ## agent exports to the CloudWatch OTLP traces endpoint, which stores spans
+      ## in the aws/spans log group; until Transaction Search is enabled that
+      ## endpoint is not usable and spans do not appear.
+      ##
+      ## Spans are billed per trace and vLLM emits one per request with no
       ## sampling of its own, so on a high-QPS endpoint set OTEL_TRACES_SAMPLER
       ## on the engine.
       traces:

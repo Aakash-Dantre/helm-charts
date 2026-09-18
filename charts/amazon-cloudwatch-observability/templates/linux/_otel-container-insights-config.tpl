@@ -3,6 +3,11 @@ extensions:
   sigv4auth/cw_k8s_ci_v0_metrics_dest:
     region: {{ .Values.region }}
     service: monitoring
+{{- if include "otel-container-insights.vllmTracesEnabled" . }}
+  sigv4auth/cw_k8s_ci_v0_traces_dest:
+    region: {{ .Values.region }}
+    service: xray
+{{- end }}
 {{- if .Values.otelContainerInsights.logs.enabled }}
   sigv4auth/cw_k8s_ci_v0_logs_dest:
     region: {{ .Values.region }}
@@ -988,44 +993,25 @@ processors:
 
 exporters:
 {{- if include "otel-container-insights.vllmTracesEnabled" . }}
-  # CloudWatchAgentServerPolicy already carries xray:PutTraceSegments, so traces
-  # need no IAM change.
+  # Spans go to the CloudWatch OTLP traces endpoint, which stores them in the
+  # OpenTelemetry semantic-convention format with W3C trace IDs -- so every
+  # attribute vLLM sets stays queryable in Transaction Search, with no indexed
+  # subset to declare and no 50-annotation segment cap to budget against.
   #
-  # Only attributes named here become annotations, and only annotations are
-  # searchable with a filter expression; X-Ray allows 50 per segment. Everything
-  # else on the span still arrives, as segment metadata.
+  # Requires Transaction Search to be enabled on the account. Until it is, this
+  # endpoint is not usable and spans do not appear.
   #
-  # These are vLLM's own attribute names. The exporter matches indexed_attributes
-  # against the unmodified key, then normalises the key it writes: with the
-  # exporter.xray.allowDot feature gate (beta since collector v0.97.0) the dot is
-  # kept, otherwise it becomes an underscore. So search with
-  # `annotation[gen_ai.latency.e2e]` -- the brackets are required for any key
-  # holding a dot -- or with `annotation.gen_ai_latency_e2e` if the gate is off.
-  #
-  # The first 13 are what the V1 engine emits; the other 5 attributes vLLM
-  # defines are dead constants left from the V0 engine. The otel.resource.*
-  # entries are how the exporter names resource attributes, and are what makes a
-  # search scopable to one model, pod or namespace.
-  awsxray/cw_k8s_ci_v0_vllm_traces:
-    region: {{ .Values.region }}
-    index_all_attributes: false
-    indexed_attributes:
-      - gen_ai.latency.e2e
-      - gen_ai.latency.time_to_first_token
-      - gen_ai.latency.time_in_queue
-      - gen_ai.latency.time_in_model_prefill
-      - gen_ai.latency.time_in_model_decode
-      - gen_ai.latency.time_in_model_inference
-      - gen_ai.usage.prompt_tokens
-      - gen_ai.usage.completion_tokens
-      - gen_ai.request.id
-      - gen_ai.request.temperature
-      - gen_ai.request.top_p
-      - gen_ai.request.max_tokens
-      - gen_ai.request.n
-      - otel.resource.inferenceservice
-      - otel.resource.k8s.pod.name
-      - otel.resource.k8s.namespace.name
+  # The endpoint is HTTP only -- it does not accept gRPC -- and takes SigV4 with
+  # the signing name "xray". CloudWatchAgentServerPolicy already grants it, so
+  # traces need no IAM change. Batches are 50 spans, well inside the endpoint's
+  # 10,000-span / 5 MB uncompressed request limits.
+  otlphttp/cw_k8s_ci_v0_traces_dest:
+    traces_endpoint: {{ if .Values.otelContainerInsights.cloudwatchTracesEndpoint }}{{ .Values.otelContainerInsights.cloudwatchTracesEndpoint | quote }}{{ else }}"https://xray.{{ .Values.region }}.amazonaws.com/v1/traces"{{ end }}
+    compression: gzip
+    tls:
+      insecure: false
+    auth:
+      authenticator: sigv4auth/cw_k8s_ci_v0_traces_dest
 {{- end }}
   otlphttp/cw_k8s_ci_v0_metrics_dest:
     endpoint: {{ if .Values.otelContainerInsights.cloudwatchMetricsEndpoint }}{{ .Values.otelContainerInsights.cloudwatchMetricsEndpoint | quote }}{{ else }}"https://monitoring.{{ .Values.region }}.amazonaws.com:443"{{ end }}
@@ -1082,6 +1068,9 @@ service:
       level: none
   extensions:
     - sigv4auth/cw_k8s_ci_v0_metrics_dest
+{{- if include "otel-container-insights.vllmTracesEnabled" . }}
+    - sigv4auth/cw_k8s_ci_v0_traces_dest
+{{- end }}
 {{- if .Values.otelContainerInsights.logs.enabled }}
     - sigv4auth/cw_k8s_ci_v0_logs_dest
     - awscloudwatchlogsprovisioner/cw_k8s_ci_v0_logs
@@ -1248,7 +1237,7 @@ service:
         - resourcedetection/cw_k8s_ci_v0
         - batch/cw_k8s_ci_v0_traces_dest
       exporters:
-        - awsxray/cw_k8s_ci_v0_vllm_traces
+        - otlphttp/cw_k8s_ci_v0_traces_dest
 {{- end }}
 
 {{- if and .Values.otelContainerInsights.solutions.enabled .Values.otelContainerInsights.solutions.knative.dataPlane.enabled }}
