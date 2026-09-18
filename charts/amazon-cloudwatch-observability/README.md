@@ -82,6 +82,28 @@ page; it is documented on the
 [Transaction Search](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/CloudWatch-Transaction-Search.html)
 pages and enforced by the endpoint.
 
+### What lands, and what vLLM does not send
+
+Spans arrive in the `aws/spans` log group in semantic-convention format with W3C trace IDs,
+so every attribute vLLM sets stays queryable — there is no indexed subset to declare.
+
+The endpoint also enrols the spans in Application Signals: it injects `aws.local.*` and
+`aws.span.kind` server-side, which creates a service entity and emits billed
+`ApplicationSignals` metrics (`Latency`, `Error`, `Fault`, `Throttle`, `InputTokens`,
+`OutputTokens`). That is not configured by this chart and cannot be turned off from here.
+
+Three limitations come from vLLM itself and are worth knowing before building on this:
+
+- **Errors are not observable.** vLLM never sets span status, and only successfully
+  finished requests are traced at all — aborts, timeouts and errors emit no span. So
+  Application Signals `Error` and `Fault` stay at zero regardless of what the engine is
+  doing. Upstream fix: [vllm#32162](https://github.com/vllm-project/vllm/pull/32162).
+- **No model name.** The V1 engine never sets `gen_ai.response.model`, so spans cannot be
+  joined to the `vllm:*` metrics by model. `service.name` carries `--served-model-name`.
+- **Traces are single-span.** vLLM honours an inbound W3C `traceparent`, but nothing in a
+  default Istio/Knative path propagates one, so there is no end-to-end trace and no
+  visibility into gateway queueing.
+
 ### Enabling tracing on the engine
 
 The chart only opens the receiver. vLLM's tracing is off by default and is enabled on the

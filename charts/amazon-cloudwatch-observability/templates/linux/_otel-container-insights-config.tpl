@@ -519,6 +519,15 @@ processors:
           - set(resource.attributes["service.name"], resource.attributes["inferenceservice"]) where resource.attributes["inferenceservice"] != nil and (resource.attributes["service.name"] == nil or IsMatch(resource.attributes["service.name"], "^unknown_service"))
           - set(resource.attributes["service.name"], resource.attributes["k8s.deployment.name"]) where resource.attributes["k8s.deployment.name"] != nil and (resource.attributes["service.name"] == nil or IsMatch(resource.attributes["service.name"], "^unknown_service"))
           - set(resource.attributes["service.name"], resource.attributes["k8s.pod.name"]) where resource.attributes["k8s.pod.name"] != nil and (resource.attributes["service.name"] == nil or IsMatch(resource.attributes["service.name"], "^unknown_service"))
+          # Without this the backend derives the entity as "eks:default", detaching
+          # the service from its cluster.
+          - set(resource.attributes["deployment.environment"], Concat(["eks:", resource.attributes["k8s.cluster.name"], "/", resource.attributes["k8s.namespace.name"]], "")) where resource.attributes["k8s.namespace.name"] != nil
+      - context: span
+        statements:
+          - set(span.attributes["gen_ai.system"], "vllm")
+          # vLLM emits the pre-1.27 semconv token names; publish both.
+          - set(span.attributes["gen_ai.usage.input_tokens"], span.attributes["gen_ai.usage.prompt_tokens"]) where span.attributes["gen_ai.usage.prompt_tokens"] != nil
+          - set(span.attributes["gen_ai.usage.output_tokens"], span.attributes["gen_ai.usage.completion_tokens"]) where span.attributes["gen_ai.usage.completion_tokens"] != nil
 
   batch/cw_k8s_ci_v0_traces_dest:
     send_batch_size: 50
