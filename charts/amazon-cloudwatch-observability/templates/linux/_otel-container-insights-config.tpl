@@ -149,6 +149,13 @@ receivers:
             - source_labels: [__meta_kubernetes_pod_label_serving_kserve_io_inferenceservice]
               regex: .+
               action: keep
+            # Only pods on this agent's own node. Without this every agent in the
+            # daemonset scrapes every matching pod in the cluster, so each series
+            # is emitted once per node -- N times the cost, and sums over the
+            # counters come out N times too high.
+            - source_labels: [__meta_kubernetes_pod_node_name]
+              regex: ${env:K8S_NODE_NAME}
+              action: keep
             # Keep the model container only, so we scrape its port and not the
             # sidecars'. Key on the container NAME, which KServe sets to
             # "kserve-container" in both Serverless and RawDeployment mode --
@@ -210,6 +217,10 @@ receivers:
             # keep only Knative revision (KServe predictor) pods
             - source_labels: [__meta_kubernetes_pod_label_serving_knative_dev_revision]
               regex: .+
+              action: keep
+            # Only pods on this agent's own node -- see the vLLM job above.
+            - source_labels: [__meta_kubernetes_pod_node_name]
+              regex: ${env:K8S_NODE_NAME}
               action: keep
             # scrape the queue-proxy user-metric port (9091, named "http-usermetric")
             - source_labels: [__meta_kubernetes_pod_container_port_name]
