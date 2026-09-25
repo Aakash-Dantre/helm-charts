@@ -1,8 +1,10 @@
 {{- if .Values.agent.enabled }}
+{{- include "cloudwatch-agent.validatePrometheusScrape" . -}}
 {{- if and (.Values.agent.autoGenerateCert.enabled) (not .Values.agent.certManager.enabled) -}}
 {{- $altNames := list ( printf "%s-service" (include "dcgm-exporter.name" .) ) ( printf "%s-service" (include "neuron-monitor.name" .) ) ( printf "%s-service.%s.svc" (include "dcgm-exporter.name" .) .Release.Namespace ) ( printf "%s-service.%s.svc" (include "neuron-monitor.name" .) .Release.Namespace ) ( printf "%s-service" (include "node-exporter.name" .) ) ( printf "%s-service.%s.svc" (include "node-exporter.name" .) .Release.Namespace ) ( include "kube-state-metrics.name" . ) ( printf "%s.%s.svc" (include "kube-state-metrics.name" .) .Release.Namespace ) -}}
 {{- range $i, $customAgent := .Values.agents }}
-{{ $altNames = append $altNames ( printf "%s-target-allocator-service" $customAgent.name )}}
+{{- $customAgentName := include "cloudwatch-agent.validatedName" ($customAgent.name | default (include "cloudwatch-agent.name" $)) -}}
+{{ $altNames = append $altNames ( printf "%s-target-allocator-service" $customAgentName )}}
 {{- end }}
 {{- $agentAltNames := list ( printf "%s" (include "cloudwatch-agent.name" .) ) ( printf "%s.%s.svc" (include "cloudwatch-agent.name" .) .Release.Namespace ) -}}
 {{- $ca := genCA ("agent-ca")  ( .Values.agent.autoGenerateCert.expiryDays | int ) -}}
@@ -64,31 +66,35 @@ data:
 {{- $region := .Values.region | required ".Values.region is required." -}}
 {{- $isROSA := eq $.Values.k8sMode "ROSA" -}}
 {{- $isAKS := eq $.Values.k8sMode "AKS" -}}
-{{- if $isAKS }}{{- $_ := $.Values.roleArn | required ".Values.roleArn is required when k8sMode is AKS." -}}{{- end }}
+{{- $isGKE := eq $.Values.k8sMode "GKE" -}}
+{{- /* AKS and GKE both reach AWS via a projected Kubernetes service-account token (web-identity federation). */ -}}
+{{- $isWorkloadIdentity := or $isAKS $isGKE -}}
+{{- if $isWorkloadIdentity }}{{- $_ := $.Values.roleArn | required ".Values.roleArn is required when k8sMode is AKS or GKE." -}}{{- end }}
 {{- range .Values.agents }}
 {{- $agent := mergeOverwrite (deepCopy $.Values.agent) . }}
+{{- $agentName := include "cloudwatch-agent.validatedName" ($agent.name | default (include "cloudwatch-agent.name" $)) -}}
 {{/* Skip cluster-scraper agent when otelContainerInsights is disabled */}}
-{{- if or $.Values.otelContainerInsights.enabled (ne $agent.name $.Values.otelContainerInsights.clusterScraperAgent) }}
+{{- if or $.Values.otelContainerInsights.enabled (ne $agentName $.Values.otelContainerInsights.clusterScraperAgent) }}
 apiVersion: cloudwatch.aws.amazon.com/v1alpha1
 kind: AmazonCloudWatchAgent
 metadata:
-  name: {{ $agent.name | default (include "cloudwatch-agent.name" $) }}
+  name: {{ $agentName | quote }}
   namespace: {{ $.Release.Namespace }}
 spec:
   {{ template "cloudwatch-agent.updateStrategy" (dict "mode" $agent.mode) }}:
-    type: {{ $agent.updateStrategy.type }}
+    type: {{ $agent.updateStrategy.type | quote }}
     {{- if eq $agent.updateStrategy.type "RollingUpdate" }}
     rollingUpdate:
-      maxUnavailable: {{ $agent.updateStrategy.rollingUpdate.maxUnavailable | default (include "cloudwatch-agent.rolloutStrategyMaxUnavailable" (dict "mode" $agent.mode)) }}
-      maxSurge: {{ $agent.updateStrategy.rollingUpdate.maxSurge | default (include "cloudwatch-agent.rolloutStrategyMaxSurge" (dict "mode" $agent.mode)) }}
+      maxUnavailable: {{ include "cloudwatch-agent.intOrStringValue" ($agent.updateStrategy.rollingUpdate.maxUnavailable | default (include "cloudwatch-agent.rolloutStrategyMaxUnavailable" (dict "mode" $agent.mode))) }}
+      maxSurge: {{ include "cloudwatch-agent.intOrStringValue" ($agent.updateStrategy.rollingUpdate.maxSurge | default (include "cloudwatch-agent.rolloutStrategyMaxSurge" (dict "mode" $agent.mode))) }}
     {{- end }}
-  image: {{ template "cloudwatch-agent.image" (merge $agent.image (dict "region" $.Values.region)) }}
-  mode: {{ $agent.mode }}
+  image: {{ include "cloudwatch-agent.image" (merge $agent.image (dict "region" $.Values.region)) | quote }}
+  mode: {{ $agent.mode | quote }}
   replicas: {{ $agent.replicas }}
   {{- with $agent.nodeSelector }}
   nodeSelector: {{- toYaml . | nindent 4 }}
   {{- end }}
-  serviceAccount: {{ $agent.serviceAccount.name | default (include "cloudwatch-agent.serviceAccountName" $) }}
+  serviceAccount: {{ $agent.serviceAccount.name | default (include "cloudwatch-agent.serviceAccountName" $) | quote }}
   {{ if $isROSA }}
   securityContext:
     runAsNonRoot: false
@@ -96,23 +102,50 @@ spec:
       add:
         - SYS_ADMIN
   {{ end }}
-  priorityClassName: {{ $agent.priorityClassName | default $.Values.agent.priorityClassName }}
+  priorityClassName: {{ include "amazon-cloudwatch-observability.common.priorityClassName" (dict "component" $agent "context" $) | quote }}
+  {{- $agentAnnotations := include "amazon-cloudwatch-observability.common.podAnnotations" (dict "component" $agent "context" $) }}
+  {{- with $agentAnnotations }}
+  podAnnotations:
+    {{- . | nindent 4 }}
+  {{- end }}
+  {{- include "amazon-cloudwatch-observability.common.topologySpreadConstraints" (dict "component" $agent "context" $) | nindent 2 }}
+  {{- $agentPdb := include "amazon-cloudwatch-observability.common.podDisruptionBudget" (dict "component" $agent "context" $) | fromYaml }}
+  {{- if $agentPdb.enabled }}
+  podDisruptionBudget:
+    {{- if hasKey $agentPdb "minAvailable" }}
+    minAvailable: {{ $agentPdb.minAvailable }}
+    {{- else if hasKey $agentPdb "maxUnavailable" }}
+    maxUnavailable: {{ $agentPdb.maxUnavailable }}
+    {{- end }}
+  {{- end }}
   {{- with $agent.affinity }}
   affinity: {{- toYaml . | nindent 4 }}
   {{- end }}
   hostNetwork: {{ $agent.hostNetwork }}
   {{- if eq ($agent.config | toString) "default:otel" }}
-  config: {{ include "cloudwatch-agent.modify-config" (merge (dict "Config" (include "cloudwatch-agent.build-config-default-otel" (dict "agentName" $agent.name "context" $) | fromJson)) $ ) }}
+  config: {{ include "cloudwatch-agent.modify-config" (merge (dict "Config" (include "cloudwatch-agent.build-config-default-otel" (dict "agentName" $agentName "context" $) | fromJson)) $ ) }}
   {{- else if and $agent.config (ne ($agent.config | toString) "default") }}
   config: {{ include "cloudwatch-agent.modify-config" (merge (dict "Config" $agent.config) $ ) }}
   {{- else }}
-  config: {{ include "cloudwatch-agent.modify-config" (merge (dict "Config" (include "cloudwatch-agent.build-default-config" (dict "agentName" $agent.name "context" $) | fromJson)) $ ) }}
+  config: {{ include "cloudwatch-agent.modify-config" (merge (dict "Config" (include "cloudwatch-agent.build-default-config" (dict "agentName" $agentName "context" $) | fromJson)) $ ) }}
   {{- end }}
-  {{- $generatedOtelConfig := include "cloudwatch-agent.build-default-otel-config" (dict "agentName" $agent.name "context" $) -}}
+  {{- $generatedOtelConfig := include "cloudwatch-agent.build-default-otel-config" (dict "agentName" $agentName "context" $) -}}
   {{- if $agent.otelConfig }}
   otelConfig: {{ include "cloudwatch-agent.modify-otel-config" (merge (dict "OtelConfig" (include "cloudwatch-agent.merge-otel-configs" (dict "Base" $generatedOtelConfig "User" $agent.otelConfig))) $) }}
   {{- else if ne (trimAll " \n\t" $generatedOtelConfig) "{}" }}
   otelConfig: {{ include "cloudwatch-agent.modify-otel-config" (merge (dict "OtelConfig" $generatedOtelConfig) $) }}
+  {{- end }}
+  {{- $otelCIScrape := eq (include "cloudwatch-agent.otelCIScrapeEnabled" (dict "agentName" $agent.name "context" $)) "true" }}
+  {{- $isClusterScraper := eq $agent.name $.Values.otelContainerInsights.clusterScraperAgent }}
+  {{- $taEnabled := or $agent.prometheus.targetAllocator.enabled $otelCIScrape }}
+  {{- $allocationStrategy := $agent.prometheus.targetAllocator.allocationStrategy | default "consistent-hashing" }}
+  {{- if $otelCIScrape }}
+  {{-   if $isClusterScraper }}
+  {{- /* central scraper runs a single/few replicas; per-node makes no sense */}}
+  {{-     $allocationStrategy = "consistent-hashing" }}
+  {{-   else }}
+  {{-     $allocationStrategy = (dig "prometheusScrape" "allocationStrategy" "per-node" $.Values.otelContainerInsights) }}
+  {{-   end }}
   {{- end }}
   {{- if $agent.prometheus.config }}
   prometheus:
@@ -120,15 +153,44 @@ spec:
     config:
       {{- toYaml . | nindent 6 }}
     {{- end }}
+  {{- else if $taEnabled }}
+  # The operator builds the Target Allocator config from spec.prometheus and requires
+  # a prometheus.config containing a scrape_configs key (see operator
+  # targetallocator/adapters GetPromConfig). With prometheusCR (ServiceMonitor/
+  # PodMonitor) discovery the static scrape list is empty -- the Target Allocator
+  # discovers targets from ServiceMonitor/PodMonitor CRs.
+  prometheus:
+    config:
+      scrape_configs: []
   {{- end }}
-  {{- if $agent.prometheus.targetAllocator.enabled }}
+  {{- if $taEnabled }}
   targetAllocator:
-    enabled: {{ $agent.prometheus.targetAllocator.enabled | default false }}
-    image: {{ template "target-allocator.image" (merge $agent.prometheus.targetAllocator.image (dict "region" $.Values.region)) }}
-    allocationStrategy: "consistent-hashing"
-    {{- if $agent.prometheus.targetAllocator.prometheusCR.enabled }}
+    enabled: true
+    image: {{ include "target-allocator.image" (merge $agent.prometheus.targetAllocator.image (dict "region" $.Values.region)) | quote }}
+    allocationStrategy: {{ $allocationStrategy | quote }}
+    {{- if or $agent.prometheus.targetAllocator.prometheusCR.enabled $otelCIScrape }}
     prometheusCR:
-      enabled: {{ $agent.prometheus.targetAllocator.prometheusCR.enabled | default false }}
+      enabled: true
+      {{- if $otelCIScrape }}
+      scrapeInterval: {{ $.Values.otelContainerInsights.metricResolution | quote }}
+      {{- if $isClusterScraper }}
+      # Annotation-based routing: this central agent's Target Allocator scrapes only monitors
+      # annotated cloudwatch.aws/scraper: cluster-scraper. The per-node agent (no scraperRole)
+      # scrapes only monitors that are NOT so annotated, so the two partition with no overlap/gap.
+      scraperRole: cluster-scraper
+      {{- end }}
+      {{- if ne (include "cloudwatch-agent.serviceMonitorEnabled" $) "true" }}
+      # serviceMonitor disabled: select a label no real ServiceMonitor
+      # carries, so the Target Allocator discovers no ServiceMonitors.
+      serviceMonitorSelector:
+        amazon-cloudwatch-observability.aws/otel-ci-scrape: disabled
+      {{- end }}
+      {{- if ne (include "cloudwatch-agent.podMonitorEnabled" $) "true" }}
+      # podMonitor disabled: select a label no real PodMonitor carries.
+      podMonitorSelector:
+        amazon-cloudwatch-observability.aws/otel-ci-scrape: disabled
+      {{- end }}
+      {{- end }}
     {{- end }}
   {{- end }}
   {{- $prunedResources := include "cloudwatch-agent.pruneNulls" $agent.resources | fromYaml }}
@@ -153,7 +215,7 @@ spec:
   - mountPath: /var/log/pods
     name: criologs
     readOnly: true
-  {{- if and $.Values.otelContainerInsights.enabled $.Values.otelContainerInsights.logs.enabled (eq $agent.name $.Values.otelContainerInsights.targetAgent) }}
+  {{- if and $.Values.otelContainerInsights.enabled $.Values.otelContainerInsights.logs.enabled (eq $agentName $.Values.otelContainerInsights.targetAgent) }}
   # /var/log covers the paths the OTEL log pipelines need: /var/log/containers/*.log
   # (app container logs), /var/log/messages, /var/log/dmesg, /var/log/secure
   # (host logs). The existing criologs mount on /var/log/pods is retained for
@@ -190,7 +252,7 @@ spec:
     name: kubelet-ca
     readOnly: true
     {{ end }}
-    {{ if $isAKS }}
+    {{ if $isWorkloadIdentity }}
   - mountPath: /var/run/secrets/aws
     name: aws-iam-token
     readOnly: true
@@ -221,7 +283,7 @@ spec:
   - hostPath:
       path:  /var/log/pods
     name: criologs
-  {{- if and $.Values.otelContainerInsights.enabled $.Values.otelContainerInsights.logs.enabled (eq $agent.name $.Values.otelContainerInsights.targetAgent) }}
+  {{- if and $.Values.otelContainerInsights.enabled $.Values.otelContainerInsights.logs.enabled (eq $agentName $.Values.otelContainerInsights.targetAgent) }}
   - hostPath:
       path: /var/log
     name: varlog
@@ -265,7 +327,7 @@ spec:
     hostPath:
       path: /etc/kubernetes/kubelet-ca.crt
   {{end }}
-  {{ if $isAKS }}
+  {{ if $isWorkloadIdentity }}
   - name: aws-iam-token
     projected:
       sources:
@@ -298,6 +360,12 @@ spec:
   {{ if $isAKS }}
   - name: RUN_IN_AKS
     value: "True"
+  {{ end }}
+  {{ if $isGKE }}
+  - name: RUN_IN_GKE
+    value: "True"
+  {{ end }}
+  {{ if $isWorkloadIdentity }}
   - name: AWS_WEB_IDENTITY_TOKEN_FILE
     value: /var/run/secrets/aws/token
   - name: AWS_ROLE_ARN
@@ -308,6 +376,15 @@ spec:
   {{- if $.Values.otelContainerInsights.enabled }}
   - name: OTEL_CI_VERSION
     value: "1.0.0"
+  {{- end }}
+  {{- if $otelCIScrape }}
+  # POD_NAME is the Target Allocator collector_id for the prometheusCR receiver
+  # (otel-container-insights config) so each scraping agent pulls its own shard.
+  # Scoped to the scrape path since only that receiver consumes ${env:POD_NAME}.
+  - name: POD_NAME
+    valueFrom:
+      fieldRef:
+        fieldPath: metadata.name
   {{- end }}
   {{- with $agent.env }}
   {{- . | toYaml | nindent 2 }}

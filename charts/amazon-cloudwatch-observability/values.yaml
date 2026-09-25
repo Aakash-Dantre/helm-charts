@@ -18,20 +18,40 @@ adcEndpointOverrides:
   eusc-de-east-1: amazonaws.eu
 ## Provide the Region (this is a required parameter)
 region:
-k8sMode: EKS # can be EKS | ROSA | K8S | AKS
-## IAM role ARN for AKS workload-identity federation (required when k8sMode is AKS)
+k8sMode: EKS # can be EKS | ROSA | K8S | AKS | GKE
+## IAM role ARN for AKS/GKE workload-identity federation (required when k8sMode is AKS or GKE)
 roleArn:
 ## Enable dualstack endpoints for IPv6 support (default: false)
 useDualstackEndpoint: false
 ## Provide default tolerations
 tolerations:
   - operator: Exists
+## Custom labels applied to addon pods. Overridable per component
+## (e.g. `manager.podLabels`, `containerLogs.fluentBit.podLabels`).
+podLabels: {}
+## Custom annotations applied to addon pods. Overridable per component.
+podAnnotations: {}
+## Topology spread constraints applied to addon pods. Overridable per component.
+## See https://kubernetes.io/docs/concepts/scheduling-eviction/topology-spread-constraints/
+topologySpreadConstraints: []
+## Default priorityClassName. Applied to workloads that don't already declare a
+## component-level priorityClassName; component values take precedence.
+priorityClassName: ""
+## Opt-in PodDisruptionBudget for supported workloads. Overridable per component.
+## When enabled, provide either maxUnavailable OR minAvailable
+## (mutually exclusive per Kubernetes PDB spec). If both are present after Helm
+## value merge (e.g. root default `maxUnavailable: 1` plus a component-level
+## `minAvailable: N`), `minAvailable` wins and `maxUnavailable` is dropped.
+podDisruptionBudget:
+  enabled: false
+  maxUnavailable: 1
+  # minAvailable:
 containerLogs:
   enabled: true
   fluentBit:
     image:
       repository: aws-for-fluent-bit
-      tag: 3.4.8
+      tag: 3.4.16
       tagWindows: 2.31.12-windowsservercore
       repositoryDomainMap:
         public: public.ecr.aws/aws-observability
@@ -466,7 +486,7 @@ manager:
   name:
   image:
     repository: cloudwatch-agent-operator
-    tag: 3.6.0
+    tag: 3.7.0
     repositoryDomainMap:
       public: public.ecr.aws/cloudwatch-agent
       cn-north-1: 934860584483.dkr.ecr.cn-north-1.amazonaws.com.cn
@@ -477,15 +497,15 @@ manager:
     java:
       repositoryDomain: public.ecr.aws/aws-observability
       repository: adot-autoinstrumentation-java
-      tag: v2.29.0
+      tag: v2.30.0
     python:
       repositoryDomain: public.ecr.aws/aws-observability
       repository: adot-autoinstrumentation-python
-      tag: v0.18.0
+      tag: v0.19.0
     dotnet:
       repositoryDomain: public.ecr.aws/aws-observability
       repository: adot-autoinstrumentation-dotnet
-      tag: v1.14.0
+      tag: v1.15.0
     nodejs:
       repositoryDomain: public.ecr.aws/aws-observability
       repository: adot-autoinstrumentation-node
@@ -640,8 +660,6 @@ manager:
   serviceAccount:
     create: true
     annotations: {}
-  podAnnotations: {}
-  podLabels: {}
   service:
     name:
   affinity: {}
@@ -726,7 +744,7 @@ agent:
   replicas: 1 # The total number non-terminated pods targeted by this AmazonCloudWatchAgent's deployment or statefulSet.
   image:
     repository: cloudwatch-agent
-    tag: 1.300070.0b1586
+    tag: 1.300073.0b1828
     repositoryDomainMap:
       public: public.ecr.aws/cloudwatch-agent
       cn-north-1: 934860584483.dkr.ecr.cn-north-1.amazonaws.com.cn
@@ -788,7 +806,16 @@ agent:
     config:
     targetAllocator:
       enabled: false
+      # For agents that enable the Target Allocator directly (not via
+      # otelContainerInsights, which sources it from prometheusScrape.allocationStrategy).
+      # consistent-hashing = hash targets across all agents; per-node = assign to the
+      # agent on the same node.
+      allocationStrategy: consistent-hashing
       image:
+        ## When the otelContainerInsights scraping path is enabled
+        ## (otelContainerInsights.prometheusScrape.enabled), this Target Allocator image
+        ## MUST support prometheusCR discovery + per-node + the scraper_role config key,
+        ## pinned together with a matching operator image; an older image CrashLoopBackOffs.
         repository: cloudwatch-agent-target-allocator
         tag: 1.0.0
         repositoryDomainMap:
@@ -890,6 +917,12 @@ dcgmExporter:
                   - g6e.24xlarge
                   - g6e.48xlarge
                   - g6e.xlarge
+                  - g7e.2xlarge
+                  - g7e.4xlarge
+                  - g7e.8xlarge
+                  - g7e.12xlarge
+                  - g7e.24xlarge
+                  - g7e.48xlarge
                   - gr6.4xlarge
                   - gr6.8xlarge
                   - p2.8xlarge
@@ -953,6 +986,12 @@ dcgmExporter:
                   - ml.g6e.24xlarge
                   - ml.g6e.48xlarge
                   - ml.g6e.xlarge
+                  - ml.g7e.2xlarge
+                  - ml.g7e.4xlarge
+                  - ml.g7e.8xlarge
+                  - ml.g7e.12xlarge
+                  - ml.g7e.24xlarge
+                  - ml.g7e.48xlarge
                   - ml.gr6.4xlarge
                   - ml.gr6.8xlarge
                   - ml.p2.8xlarge
@@ -980,7 +1019,7 @@ neuronMonitor:
   name:
   image:
     repository: neuron-monitor
-    tag: 1.11.0
+    tag: 1.12.0
     repositoryDomainMap:
       public: public.ecr.aws/neuron
   resources:
@@ -1055,7 +1094,7 @@ kubeStateMetrics:
   ## TODO: Add replicas, PDB, and HPA configuration in a follow-up.
   image:
     repository: kube-state-metrics/kube-state-metrics
-    tag: v2.19.1
+    tag: v2.20.0
     repositoryDomainMap:
       public: registry.k8s.io
       cn-north-1: 918309763551.dkr.ecr.cn-north-1.amazonaws.com.cn
@@ -1064,7 +1103,7 @@ kubeStateMetrics:
       us-gov-west-1: 013241004608.dkr.ecr.us-gov-west-1.amazonaws.com
     # Used in China/GovCloud regions where the public upstream image isn't available; the helper falls back to repositoryDomainMap[region]/restrictedRepository:restrictedTag
     restrictedRepository: eks/kube-state-metrics
-    restrictedTag: v2.19.1-eksbuild.3
+    restrictedTag: v2.20.0-eksbuild.6
   resources:
     limits:
       cpu: 200m
@@ -1099,7 +1138,7 @@ nodeExporter:
       us-gov-west-1: 013241004608.dkr.ecr.us-gov-west-1.amazonaws.com
     # Used in China/GovCloud regions where the public upstream image isn't available; the helper falls back to repositoryDomainMap[region]/restrictedRepository:restrictedTag
     restrictedRepository: eks/prometheus-node-exporter
-    restrictedTag: v1.12.1-eksbuild.1
+    restrictedTag: v1.12.1-eksbuild.7
   resources:
     limits:
       cpu: 200m
@@ -1163,6 +1202,49 @@ otelContainerInsights:
   ## Only takes effect when otelContainerInsights.enabled is true.
   logs:
     enabled: true
+  ## ServiceMonitor/PodMonitor scraping (monitoring.coreos.com/v1) via the Target
+  ## Allocator's prometheusCR discovery. When otelContainerInsights.enabled is true,
+  ## enabling this gives SM/PM scraping end-to-end (CRDs + Target Allocator +
+  ## prometheusCR + RBAC). Only takes effect when otelContainerInsights.enabled is true.
+  ##
+  ## IMAGE PREREQUISITE: this path drives the Target Allocator with prometheusCR
+  ## discovery, the per-node allocation strategy, and a scraper_role config key. The
+  ## pinned Target Allocator image (agent.prometheus.targetAllocator.image, default
+  ## cloudwatch-agent-target-allocator:1.0.0) AND the operator image must both be builds
+  ## that support these -- an older image CrashLoopBackOffs on boot rather than degrading.
+  ## prometheusScrape.enabled defaults true, so it turns on with otelContainerInsights:
+  ## pin a compatible operator + Target Allocator image (together, in the same release)
+  ## before enabling otelContainerInsights, or set prometheusScrape.enabled=false until
+  ## that image ships.
+  prometheusScrape:
+    ## Master switch. false = run OTEL CI (metrics/logs) with no SM/PM scraping
+    ## (no prometheusCR discovery, no CRD bundling under `auto`, no CRD RBAC).
+    enabled: true
+    ## How the Target Allocator distributes targets across agents.
+    ##   per-node           - assign each target to the agent on its node (avoids
+    ##                        cross-AZ scrape traffic); node-less targets fall back to hashing.
+    ##   consistent-hashing - spread targets across all agents by hash.
+    allocationStrategy: per-node
+    ## Bundle the community SM/PM CRDs so they aren't a manual prerequisite. Shipped as
+    ## templated manifests (upgraded by Helm), skipped if an unmanaged copy already
+    ## exists (never clobbers a prometheus-operator one), and annotated
+    ## helm.sh/resource-policy: keep so uninstall won't cascade-delete the SM/PM CRs.
+    crds:
+      ##   auto   - bundle only when otelContainerInsights + prometheusScrape are enabled (default)
+      ##   always - always bundle (still skipped if an unmanaged copy exists)
+      ##   never  - never bundle
+      ##
+      ## The skip-if-exists guard relies on `lookup`, which is empty under `helm template`.
+      ## So in GitOps flows (Argo/Flux render-then-apply) the bundled CRD is always emitted
+      ## and can overwrite/downgrade a CRD you manage separately. If you manage the
+      ## ServiceMonitor/PodMonitor CRDs yourself (e.g. via prometheus-operator or GitOps),
+      ## set `never` to opt out of bundling entirely.
+      install: auto
+    ## Advanced: set one to false to discover only the other monitor type.
+    serviceMonitor:
+      enabled: true
+    podMonitor:
+      enabled: true
   ## The agent in the agents array that receives node-level OTEL Container Insights config.
   targetAgent: "cloudwatch-agent"
   ## The agent in the agents array that receives cluster-level OTEL Container Insights config (apiserver, kube-state-metrics scraping).
@@ -1188,3 +1270,10 @@ otelContainerInsights:
       enabled: true
       ## Namespace where Karpenter is deployed.
       namespace: "kube-system"
+    ## KEDA — Kubernetes Event-Driven Autoscaling.
+    ## Scrapes the Prometheus metrics endpoint exposed by the KEDA operator.
+    ## Requires prometheus.operator.enabled=true in KEDA's Helm values.
+    keda:
+      enabled: true
+      ## Namespace where KEDA is deployed.
+      namespace: "keda"

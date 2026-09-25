@@ -5,6 +5,33 @@ Expand the name of the chart.
 {{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
+{{/*
+Whether to bundle the community ServiceMonitor/PodMonitor CRDs. Honours
+.Values.otelContainerInsights.prometheusScrape.crds.install:
+  "always" => true; "never" => empty;
+  "auto" (default) => true only when otelContainerInsights.enabled AND
+  otelContainerInsights.prometheusScrape.enabled are both true.
+Returns the string "true" when CRDs should be rendered, empty otherwise.
+*/}}
+{{- define "amazon-cloudwatch-observability.prometheusCRDsEnabled" -}}
+{{- $install := (dig "prometheusScrape" "crds" "install" "auto" .Values.otelContainerInsights) -}}
+{{- /* Back-compat: honor the legacy top-level prometheusCRDs.install if set (deprecated). */ -}}
+{{- if hasKey .Values "prometheusCRDs" -}}
+{{- $install = (dig "install" $install .Values.prometheusCRDs) -}}
+{{- end -}}
+{{- $scrapeEnabled := (dig "prometheusScrape" "enabled" true .Values.otelContainerInsights) -}}
+{{- if eq $install "always" -}}
+true
+{{- else if eq $install "never" -}}
+{{- else if eq $install "auto" -}}
+{{- if and .Values.otelContainerInsights.enabled $scrapeEnabled -}}
+true
+{{- end -}}
+{{- else -}}
+{{- fail (printf "prometheusCRDs.install must be one of \"auto\", \"always\", or \"never\", got: %s" $install) -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "amazon-cloudwatch-observability.common.tolerations" -}}
 {{- $tolerations := .context.Values.tolerations }}
 {{- if .component }}
@@ -17,6 +44,147 @@ Expand the name of the chart.
 tolerations:
   {{- toYaml . | nindent 2 }}
 {{- end }}
+{{- end }}
+
+{{/*
+Resolve podLabels for a workload. Component value overrides root when defined
+(explicit empty map `{}` counts as an override — same semantics as
+`common.tolerations`).
+
+Callers may pass a `reserved` list of label keys the workload's pod template
+already emits as built-ins (e.g. selector labels). Those keys are stripped from
+the returned user-provided labels so the rendered pod template contains no
+duplicate keys and user input cannot override operator-managed selector labels.
+
+Returns the map rendered as YAML content (no wrapping key).
+
+Usage:
+  {{- $labels := include "amazon-cloudwatch-observability.common.podLabels" (dict
+       "component" .Values.manager
+       "context"   .
+       "reserved"  (list "app.kubernetes.io/name" "control-plane"))
+       }}
+  {{- with $labels }}{{ . | nindent 8 }}{{ end }}
+*/}}
+{{- define "amazon-cloudwatch-observability.common.podLabels" -}}
+{{- $v := .context.Values.podLabels }}
+{{- if .component }}
+  {{- $componentPodLabels := dig "podLabels" nil .component }}
+  {{- if ne nil $componentPodLabels }}
+    {{- $v = $componentPodLabels }}
+  {{- end }}
+{{- end }}
+{{- if and $v .reserved }}
+  {{- $reserved := .reserved }}
+  {{- $filtered := dict }}
+  {{- range $k, $val := $v }}
+    {{- if not (has $k $reserved) }}
+      {{- $_ := set $filtered $k $val }}
+    {{- end }}
+  {{- end }}
+  {{- $v = $filtered }}
+{{- end }}
+{{- with $v }}{{ toYaml . }}{{ end }}
+{{- end }}
+
+{{/*
+Resolve podAnnotations for a workload. Component value overrides root when
+defined (explicit empty map counts as an override).
+*/}}
+{{- define "amazon-cloudwatch-observability.common.podAnnotations" -}}
+{{- $v := .context.Values.podAnnotations }}
+{{- if .component }}
+  {{- $componentPodAnnotations := dig "podAnnotations" nil .component }}
+  {{- if ne nil $componentPodAnnotations }}
+    {{- $v = $componentPodAnnotations }}
+  {{- end }}
+{{- end }}
+{{- with $v }}{{ toYaml . }}{{ end }}
+{{- end }}
+
+{{/*
+Resolve topologySpreadConstraints for a workload. Component value overrides
+root when defined (explicit empty list counts as an override). Emits
+`topologySpreadConstraints: [ ... ]` block or nothing.
+Usage:
+  {{- include "amazon-cloudwatch-observability.common.topologySpreadConstraints" (dict "component" .Values.manager "context" .) | nindent 6 }}
+*/}}
+{{- define "amazon-cloudwatch-observability.common.topologySpreadConstraints" -}}
+{{- $v := .context.Values.topologySpreadConstraints }}
+{{- if .component }}
+  {{- $componentTsc := dig "topologySpreadConstraints" nil .component }}
+  {{- if ne nil $componentTsc }}
+    {{- $v = $componentTsc }}
+  {{- end }}
+{{- end }}
+{{- with $v }}
+topologySpreadConstraints:
+  {{- toYaml . | nindent 2 }}
+{{- end }}
+{{- end }}
+
+{{/*
+Resolve priorityClassName for a workload. Returns the bare string (empty if unset).
+Component value overrides root when defined (explicit empty string counts as an override).
+Usage:
+  {{- $pcn := include "amazon-cloudwatch-observability.common.priorityClassName" (dict "component" .Values.manager "context" .) }}
+  {{- if $pcn }}priorityClassName: {{ $pcn | quote }}{{ end }}
+*/}}
+{{- define "amazon-cloudwatch-observability.common.priorityClassName" -}}
+{{- $v := .context.Values.priorityClassName | default "" -}}
+{{- if .component }}
+  {{- $componentPcn := dig "priorityClassName" nil .component }}
+  {{- if ne nil $componentPcn }}
+    {{- $v = $componentPcn }}
+  {{- end }}
+{{- end }}
+{{- $v -}}
+{{- end }}
+
+{{/*
+Resolve podDisruptionBudget for a workload. Returns the effective PDB object
+as YAML (parse with fromYaml). Component value overrides root when defined
+(explicit empty dict counts as an override).
+Usage:
+  {{- $pdb := include "amazon-cloudwatch-observability.common.podDisruptionBudget" (dict "component" .Values.manager "context" .) | fromYaml }}
+  {{- if $pdb.enabled }}...{{ end }}
+*/}}
+{{- define "amazon-cloudwatch-observability.common.podDisruptionBudget" -}}
+{{- $v := .context.Values.podDisruptionBudget | default dict -}}
+{{- if .component }}
+  {{- $componentPdb := dig "podDisruptionBudget" nil .component }}
+  {{- if ne nil $componentPdb }}
+    {{- $v = $componentPdb }}
+  {{- end }}
+{{- end }}
+{{- toYaml $v -}}
+{{- end }}
+
+{{/*
+Render a PodDisruptionBudget resource. Callers pass:
+  name       — PDB metadata.name
+  namespace  — target namespace (usually .Release.Namespace)
+  selector   — dict of matchLabels for spec.selector
+  pdb        — the resolved PDB object (must have enabled: true; maxUnavailable and/or minAvailable)
+  ctx        — the root context (.) for common labels
+*/}}
+{{- define "amazon-cloudwatch-observability.renderPodDisruptionBudget" -}}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .name }}
+  namespace: {{ .namespace }}
+  labels:
+    {{- include "amazon-cloudwatch-observability.labels" .ctx | nindent 4 }}
+spec:
+  {{- if hasKey .pdb "minAvailable" }}
+  minAvailable: {{ .pdb.minAvailable }}
+  {{- else if hasKey .pdb "maxUnavailable" }}
+  maxUnavailable: {{ .pdb.maxUnavailable }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- toYaml .selector | nindent 6 }}
 {{- end }}
 
 {{/*
@@ -212,6 +380,61 @@ Logic:
 {{- end -}}
 
 {{/*
+Returns "true" when otelContainerInsights-driven ServiceMonitor/PodMonitor scraping
+applies to the given agent. True when otelContainerInsights is enabled,
+otelContainerInsights.prometheusScrape.enabled is true (the single opt-out switch),
+and the agent is either the configured targetAgent (per-node scraping of unrouted
+monitors) or the clusterScraperAgent (central scraping of monitors explicitly routed
+with cloudwatch.aws/scraper: cluster-scraper). Individual monitor types are NOT
+considered here — use cloudwatch-agent.serviceMonitorEnabled /
+cloudwatch-agent.podMonitorEnabled for those.
+Accepts a dict with "agentName" (string) and "context" (root context $).
+*/}}
+{{- define "cloudwatch-agent.otelCIScrapeEnabled" -}}
+{{- $ctx := .context -}}
+{{- $agentName := .agentName -}}
+{{- if and $ctx.Values.otelContainerInsights.enabled (dig "prometheusScrape" "enabled" true $ctx.Values.otelContainerInsights) (or (eq $agentName $ctx.Values.otelContainerInsights.targetAgent) (eq $agentName $ctx.Values.otelContainerInsights.clusterScraperAgent)) -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{/*
+Whether ServiceMonitor / PodMonitor discovery is enabled. Honors the legacy
+otelContainerInsights.serviceMonitor.enabled / .podMonitor.enabled if set
+(deprecated), otherwise otelContainerInsights.prometheusScrape.<monitor>.enabled
+(default true). Return "true" when enabled, empty otherwise.
+*/}}
+{{- define "cloudwatch-agent.serviceMonitorEnabled" -}}
+{{- $v := dig "prometheusScrape" "serviceMonitor" "enabled" true .Values.otelContainerInsights -}}
+{{- if hasKey .Values.otelContainerInsights "serviceMonitor" -}}
+{{- $v = dig "serviceMonitor" "enabled" $v .Values.otelContainerInsights -}}
+{{- end -}}
+{{- if $v -}}true{{- end -}}
+{{- end -}}
+
+{{- define "cloudwatch-agent.podMonitorEnabled" -}}
+{{- $v := dig "prometheusScrape" "podMonitor" "enabled" true .Values.otelContainerInsights -}}
+{{- if hasKey .Values.otelContainerInsights "podMonitor" -}}
+{{- $v = dig "podMonitor" "enabled" $v .Values.otelContainerInsights -}}
+{{- end -}}
+{{- if $v -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+Reject a contradictory scraping config. prometheusScrape.enabled=true with BOTH
+ServiceMonitor and PodMonitor discovery disabled would render an idle Target Allocator
+(and bundle CRDs) that discovers nothing. Fail loudly rather than ship a no-op path.
+Invoked from an always-rendered template so it runs regardless of which agents render.
+*/}}
+{{- define "cloudwatch-agent.validatePrometheusScrape" -}}
+{{- if and .Values.otelContainerInsights.enabled (dig "prometheusScrape" "enabled" true .Values.otelContainerInsights) -}}
+{{- if and (ne (include "cloudwatch-agent.serviceMonitorEnabled" .) "true") (ne (include "cloudwatch-agent.podMonitorEnabled" .) "true") -}}
+{{- fail "otelContainerInsights.prometheusScrape.enabled=true requires at least one of prometheusScrape.serviceMonitor.enabled or prometheusScrape.podMonitor.enabled to be true; enable one, or set prometheusScrape.enabled=false" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 Helper function to modify cloudwatch-agent config
 */}}
 {{- define "cloudwatch-agent.config-modifier" -}}
@@ -311,6 +534,23 @@ Validates metricResolution is in "<N>s" format.
 {{- end -}}
 {{- end -}}
 
+{{/*
+Render a Kubernetes IntOrString value (for example rollingUpdate.maxUnavailable).
+The API accepts either a bare integer or a percentage string, so a plain number
+must not be quoted: "1" is rejected with 'a valid percent string must be a
+numeric string followed by an ending %'. Emit digits bare and quote anything
+else, which keeps percentages valid while still preventing a configured value
+from breaking out of its YAML scalar.
+*/}}
+{{- define "cloudwatch-agent.intOrStringValue" -}}
+{{- $value := . | toString -}}
+{{- if regexMatch "^[0-9]+$" $value -}}
+{{- $value -}}
+{{- else -}}
+{{- $value | quote -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "cloudwatch-agent.updateStrategy" -}}
 {{- if eq .mode "deployment" -}}
 deploymentUpdateStrategy
@@ -328,10 +568,26 @@ updateStrategy
 {{- end -}}
 
 {{/*
+Validate a CloudWatch Agent name. The 36-character limit leaves room for the
+longest generated resource suffix (-windows-container-insights) within the
+Kubernetes 63-character DNS label limit.
+*/}}
+{{- define "cloudwatch-agent.validatedName" -}}
+{{- $name := . | toString -}}
+{{- if gt (len $name) 36 -}}
+{{- fail "CloudWatch Agent names must be at most 36 characters" -}}
+{{- end -}}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" $name) -}}
+{{- fail "CloudWatch Agent names must be valid DNS-1123 labels" -}}
+{{- end -}}
+{{- $name -}}
+{{- end }}
+
+{{/*
 Name for cloudwatch-agent
 */}}
 {{- define "cloudwatch-agent.name" -}}
-{{- default "cloudwatch-agent" .Values.agent.name }}
+{{- include "cloudwatch-agent.validatedName" (default "cloudwatch-agent" .Values.agent.name) -}}
 {{- end }}
 
 {{/*
@@ -397,6 +653,20 @@ Get the current recommended fluent-bit image for a region
 {{- end -}}
 {{- printf "%s/%s:%s" $imageDomain .Values.containerLogs.fluentBit.image.repository .Values.containerLogs.fluentBit.image.tag -}}
 {{- end -}}
+
+{{/*
+Validate a Fluent Bit ConfigMap key and @INCLUDE file name.
+*/}}
+{{- define "fluent-bit.validatedConfigKey" -}}
+{{- $key := . | toString -}}
+{{- if gt (len $key) 253 -}}
+{{- fail "Fluent Bit extraFiles keys must be at most 253 characters" -}}
+{{- end -}}
+{{- if not (regexMatch "^[A-Za-z0-9._-]+$" $key) -}}
+{{- fail "Fluent Bit extraFiles keys may contain only alphanumeric characters, '.', '_' or '-'" -}}
+{{- end -}}
+{{- $key -}}
+{{- end }}
 
 {{/*
 Helper function to add dualstack endpoints to fluent-bit OUTPUT sections
@@ -567,16 +837,16 @@ Create the name of the service account to use for neuron monitor
 {{- default "neuron-monitor-service-acct" .Values.neuronMonitor.serviceAccount.name }}
 {{- end }}
 
+{{/*
+Legacy helpers kept for backward compatibility. Delegate to the common helpers,
+sourcing from `manager` at the component level so root-level values are inherited.
+*/}}
 {{- define "amazon-cloudwatch-observability.podAnnotations" -}}
-{{- if .Values.manager.podAnnotations }}
-{{- .Values.manager.podAnnotations | toYaml }}
-{{- end }}
+{{- include "amazon-cloudwatch-observability.common.podAnnotations" (dict "component" .Values.manager "context" .) }}
 {{- end }}
 
 {{- define "amazon-cloudwatch-observability.podLabels" -}}
-{{- if .Values.manager.podLabels }}
-{{- .Values.manager.podLabels | toYaml }}
-{{- end }}
+{{- include "amazon-cloudwatch-observability.common.podLabels" (dict "component" .Values.manager "context" .) }}
 {{- end }}
 
 {{/*

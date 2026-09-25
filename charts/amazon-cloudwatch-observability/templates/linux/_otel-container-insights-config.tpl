@@ -43,6 +43,23 @@ receivers:
             - targets:
                 - ${env:HOST_IP}:10250
 
+{{- if dig "prometheusScrape" "enabled" true .Values.otelContainerInsights }}
+  # ServiceMonitor/PodMonitor scraping via the Target Allocator (prometheusCR discovery).
+  # The Target Allocator deployed for the targetAgent serves the scrape jobs derived from
+  # ServiceMonitor/PodMonitor CRs; this receiver pulls this collector's assigned shard and
+  # routes the series into the v2 OTLP pipeline (-> CloudWatch/Zeus). Requires the Target
+  # Allocator + prometheusCR to be enabled for the targetAgent and the POD_NAME env (set below).
+  prometheus/cw_k8s_ci_v0_prometheuscr:
+    target_allocator:
+      endpoint: https://{{ .Values.otelContainerInsights.targetAgent }}-target-allocator-service:80
+      interval: {{ .Values.otelContainerInsights.metricResolution }}
+      collector_id: ${env:POD_NAME}
+      tls:
+        ca_file: /etc/amazon-cloudwatch-observability-agent-cert/tls-ca.crt
+        cert_file: /etc/amazon-cloudwatch-observability-agent-ta-client-cert/client.crt
+        key_file: /etc/amazon-cloudwatch-observability-agent-ta-client-cert/client.key
+{{- end }}
+
   {{- if .Values.dcgmExporter.enabled }}
   prometheus/cw_k8s_ci_v0_dcgm:
     config:
@@ -329,6 +346,18 @@ processors:
           - set(attributes["cloudwatch.solution"], "k8s-otel-container-insights")
           - set(attributes["cloudwatch.pipeline"], "efa")
 
+{{- if dig "prometheusScrape" "enabled" true .Values.otelContainerInsights }}
+  transform/cw_k8s_ci_v0_set_scope_prometheuscr:
+    error_mode: ignore
+    metric_statements:
+      - context: scope
+        statements:
+          - set(scope.schema_url, "")
+          - set(attributes["cloudwatch.source"], "cloudwatch-agent")
+          - set(attributes["cloudwatch.solution"], "k8s-otel-container-insights")
+          - set(attributes["cloudwatch.pipeline"], "prometheus-cr")
+{{- end }}
+
   transform/cw_k8s_ci_v0_set_scope_ebs_csi:
     error_mode: ignore
     metric_statements:
@@ -393,6 +422,18 @@ processors:
         cloud.region: { enabled: true }
         host.id: { enabled: true }
         host.name: { enabled: true }
+    {{- else if eq .Values.k8sMode "GKE" }}
+    detectors: [gcp]
+    gcp:
+      resource_attributes:
+        cloud.account.id: { enabled: true }
+        cloud.availability_zone: { enabled: true }
+        cloud.platform: { enabled: true }
+        cloud.provider: { enabled: true }
+        cloud.region: { enabled: true }
+        host.id: { enabled: true }
+        host.name: { enabled: true }
+        k8s.cluster.name: { enabled: false }
     {{- else }}
     detectors: [eks, ec2]
     ec2:
@@ -448,6 +489,8 @@ processors:
         - k8s.job.name
         - k8s.cronjob.name
       labels:
+        # $$$1 -> literal $1 backreference (group 1 = label key). The agent's OTel confmap
+        # resolves it twice (expandconverter + resolver), each collapsing $$->$; Helm leaves it as-is.
         - tag_name: "k8s.pod.label.$$$1"
           key_regex: "(.*)"
           from: pod
@@ -494,6 +537,12 @@ processors:
           - set(resource.attributes["cloud.resource_id"], Concat(["/subscriptions/", resource.attributes["cloud.account.id"], "/resourceGroups/", resource.attributes["_tmp.azure.resourcegroup.name"], "/providers/Microsoft.ContainerService/managedClusters/", resource.attributes["k8s.cluster.name"]], ""))
             where resource.attributes["cloud.account.id"] != nil and resource.attributes["_tmp.azure.resourcegroup.name"] != nil and resource.attributes["k8s.cluster.name"] != nil
           - delete_key(resource.attributes, "_tmp.azure.resourcegroup.name")
+          {{- else if eq .Values.k8sMode "GKE" }}
+          {{/* GKE full resource name: zones/<zone> (zonal) or locations/<region> (regional). */}}
+          - set(resource.attributes["cloud.resource_id"], Concat(["//container.googleapis.com/projects/", resource.attributes["cloud.account.id"], "/zones/", resource.attributes["cloud.availability_zone"], "/clusters/", resource.attributes["k8s.cluster.name"]], ""))
+            where resource.attributes["cloud.account.id"] != nil and resource.attributes["cloud.availability_zone"] != nil and resource.attributes["k8s.cluster.name"] != nil
+          - set(resource.attributes["cloud.resource_id"], Concat(["//container.googleapis.com/projects/", resource.attributes["cloud.account.id"], "/locations/", resource.attributes["cloud.region"], "/clusters/", resource.attributes["k8s.cluster.name"]], ""))
+            where resource.attributes["cloud.resource_id"] == nil and resource.attributes["cloud.account.id"] != nil and resource.attributes["cloud.region"] != nil and resource.attributes["k8s.cluster.name"] != nil
           {{- else }}
           - set(resource.attributes["cloud.resource_id"], Concat(["arn:aws:eks:", resource.attributes["cloud.region"], ":", resource.attributes["cloud.account.id"], ":cluster/", resource.attributes["k8s.cluster.name"]], ""))
             where resource.attributes["cloud.region"] != nil and resource.attributes["cloud.account.id"] != nil and resource.attributes["k8s.cluster.name"] != nil
@@ -518,7 +567,7 @@ processors:
           - set(resource.attributes["k8s.workload.type"], "CronJob") where resource.attributes["k8s.cronjob.name"] != nil and resource.attributes["k8s.workload.type"] == nil
           - set(resource.attributes["k8s.workload.name"], resource.attributes["k8s.replicaset.name"]) where resource.attributes["k8s.workload.name"] == nil and resource.attributes["k8s.replicaset.name"] != nil
           - set(resource.attributes["k8s.workload.type"], "ReplicaSet") where resource.attributes["k8s.replicaset.name"] != nil and resource.attributes["k8s.workload.type"] == nil
-          {{- if eq .Values.k8sMode "AKS" }}
+          {{- if or (eq .Values.k8sMode "AKS") (eq .Values.k8sMode "GKE") }}
           - set(resource.attributes["service.name"], resource.attributes["k8s.workload.name"]) where resource.attributes["service.name"] == nil and resource.attributes["k8s.workload.name"] != nil
           - set(resource.attributes["service.namespace"], resource.attributes["k8s.namespace.name"]) where resource.attributes["service.namespace"] == nil and resource.attributes["k8s.namespace.name"] != nil
           - set(resource.attributes["deployment.environment.name"], Concat([resource.attributes["cloud.platform"], Concat([resource.attributes["k8s.cluster.name"], resource.attributes["k8s.namespace.name"]], "/")], ":")) where resource.attributes["deployment.environment.name"] == nil and resource.attributes["cloud.platform"] != nil and resource.attributes["k8s.cluster.name"] != nil and resource.attributes["k8s.namespace.name"] != nil
@@ -707,7 +756,7 @@ processors:
           # Logs need service.name; metrics use k8s.workload.name directly, except on
           # AKS — see transform/cw_k8s_ci_v0_set_workload.
           - set(attributes["service.name"], attributes["k8s.workload.name"]) where attributes["service.name"] == nil and attributes["k8s.workload.name"] != nil
-          {{- if eq .Values.k8sMode "AKS" }}
+          {{- if or (eq .Values.k8sMode "AKS") (eq .Values.k8sMode "GKE") }}
           - set(attributes["service.namespace"], attributes["k8s.namespace.name"]) where attributes["service.namespace"] == nil and attributes["k8s.namespace.name"] != nil
           - set(attributes["deployment.environment.name"], Concat([attributes["cloud.platform"], Concat([attributes["k8s.cluster.name"], attributes["k8s.namespace.name"]], "/")], ":")) where attributes["deployment.environment.name"] == nil and attributes["cloud.platform"] != nil and attributes["k8s.cluster.name"] != nil and attributes["k8s.namespace.name"] != nil
           {{- end }}
@@ -733,6 +782,12 @@ processors:
           - set(attributes["cloud.resource_id"], Concat(["/subscriptions/", attributes["cloud.account.id"], "/resourceGroups/", attributes["_tmp.azure.resourcegroup.name"], "/providers/Microsoft.ContainerService/managedClusters/", attributes["k8s.cluster.name"]], ""))
             where attributes["cloud.account.id"] != nil and attributes["_tmp.azure.resourcegroup.name"] != nil and attributes["k8s.cluster.name"] != nil
           - delete_key(attributes, "_tmp.azure.resourcegroup.name")
+          {{- else if eq .Values.k8sMode "GKE" }}
+          {{/* GKE full resource name: zones/<zone> (zonal) or locations/<region> (regional). */}}
+          - set(attributes["cloud.resource_id"], Concat(["//container.googleapis.com/projects/", attributes["cloud.account.id"], "/zones/", attributes["cloud.availability_zone"], "/clusters/", attributes["k8s.cluster.name"]], ""))
+            where attributes["cloud.account.id"] != nil and attributes["cloud.availability_zone"] != nil and attributes["k8s.cluster.name"] != nil
+          - set(attributes["cloud.resource_id"], Concat(["//container.googleapis.com/projects/", attributes["cloud.account.id"], "/locations/", attributes["cloud.region"], "/clusters/", attributes["k8s.cluster.name"]], ""))
+            where attributes["cloud.resource_id"] == nil and attributes["cloud.account.id"] != nil and attributes["cloud.region"] != nil and attributes["k8s.cluster.name"] != nil
           {{- else }}
           - set(attributes["cloud.resource_id"], Concat(["arn:aws:eks:", attributes["cloud.region"], ":", attributes["cloud.account.id"], ":cluster/", attributes["k8s.cluster.name"]], ""))
             where attributes["cloud.region"] != nil and attributes["cloud.account.id"] != nil and attributes["k8s.cluster.name"] != nil
@@ -886,6 +941,28 @@ service:
         - batch/cw_k8s_ci_v0_metrics_dest
       exporters:
         - otlphttp/cw_k8s_ci_v0_metrics_dest
+
+{{- if dig "prometheusScrape" "enabled" true .Values.otelContainerInsights }}
+    metrics/cw_k8s_ci_v0_prometheuscr:
+      receivers: [prometheus/cw_k8s_ci_v0_prometheuscr]
+      # Phase 1 chain to get ServiceMonitor/PodMonitor series flowing to v2, plus the
+      # shared normalization/cap every other CI metrics pipeline applies before batch
+      # (cloud resource id, schema-url clear, attribute limit) so SM/PM metrics are
+      # normalized and bounded the same way. Richer OTel enrichment (k8sattributes
+      # pod/node, workload, etc.) is intentionally deferred to the Phase 3 enrichment work.
+      processors:
+        - filter/cw_k8s_ci_v0_scrape_metadata
+        - metricstarttime/cw_k8s_ci_v0
+        - transform/cw_k8s_ci_v0_set_cluster_name
+        - transform/cw_k8s_ci_v0_set_scope_prometheuscr
+        - resourcedetection/cw_k8s_ci_v0
+        - transform/cw_k8s_ci_v0_set_cloud_resource_id
+        - transform/cw_k8s_ci_v0_clear_schema_url
+        - awsattributelimit/cw_k8s_ci_v0
+        - batch/cw_k8s_ci_v0_metrics_dest
+      exporters:
+        - otlphttp/cw_k8s_ci_v0_metrics_dest
+{{- end }}
 
     {{- if .Values.dcgmExporter.enabled }}
     metrics/cw_k8s_ci_v0_dcgm:
