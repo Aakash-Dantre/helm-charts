@@ -1173,6 +1173,9 @@ otelContainerInsights:
   cloudwatchMetricsEndpoint: ""
   # Override the CloudWatch Logs OTLP endpoint. If empty, defaults to logs.<region>.amazonaws.com.
   cloudwatchLogsEndpoint: ""
+  # Override the CloudWatch Traces OTLP endpoint. If empty, defaults to
+  # xray.<region>.amazonaws.com/v1/traces.
+  cloudwatchTracesEndpoint: ""
   ## ── Solutions ──────────────────────────────────────────────────────────
   ## Optional Prometheus metric scraping for well-known cluster components.
   ## Each solution is gated by its own enabled flag so customers only scrape
@@ -1195,3 +1198,42 @@ otelContainerInsights:
       enabled: true
       ## Namespace where KEDA is deployed.
       namespace: "keda"
+    ## vLLM — the model server's own metrics (vllm:* and http_* series).
+    ## Scrapes the model container on KServe InferenceService pods and any
+    ## container running a vLLM image. See the chart README.
+    vllm:
+      enabled: true
+      ## vLLM request traces. Requires Transaction Search on the account and
+      ## --otlp-traces-endpoint on the engine; see the README.
+      traces:
+        enabled: false
+        ## Agent listen ports for pushed spans. Bound on the node, so they
+        ## avoid the conventional 4317/4318.
+        grpcPort: 4319
+        httpPort: 4320
+    ## KServe — operator health from the kserve-controller-manager, via its
+    ## kube-rbac-proxy on :8443. Scraped by the cluster-scraper.
+    kserve:
+      controlPlane:
+        enabled: true
+        ## Namespace where the kserve-controller-manager runs.
+        namespace: kserve
+    ## Knative Serving — the substrate KServe uses in Serverless mode, absent in
+    ## RawDeployment mode. Both pre- and post-1.19 metric names are handled.
+    knative:
+      ## Request metrics from the queue-proxy sidecar (:9091). On Serving >= 1.19
+      ## this also needs request-metrics-protocol set; see the README.
+      dataPlane:
+        enabled: true
+        ## Namespace where the Knative revision pods run. Empty = all namespaces.
+        namespace: ""
+      ## Autoscaler, activator, controller and webhook metrics from :9090.
+      ## Scraped by the cluster-scraper.
+      controlPlane:
+        enabled: true
+        ## Namespace where the Knative Serving components run.
+        namespace: knative-serving
+      ## Knative request traces. Requires Transaction Search on the account and
+      ## tracing-protocol/tracing-endpoint in config-observability; see the README.
+      traces:
+        enabled: false
